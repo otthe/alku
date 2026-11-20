@@ -1,4 +1,4 @@
-#include "alku_runtime.h"
+#include "alku_internal.h"
 #include "alku_gc.h"
 
 #include <errno.h>
@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static _Noreturn void out_of_memory(void) {
+_Noreturn void out_of_memory(void) {
     fputs("** out of memory\n", stderr);
     exit(1);
 }
@@ -18,12 +18,7 @@ static _Noreturn void out_of_memory(void) {
 
 /* Text is formatted into a buffer first and written in one go, so a
  * failing io:format prints nothing, as in Erlang. */
-typedef struct {
-    char *data;
-    size_t length, capacity;
-} Buffer;
-
-static void buf_putc(Buffer *b, char c) {
+void buf_putc(Buffer *b, char c) {
     if (b->length == b->capacity) {
         b->capacity = b->capacity ? 2 * b->capacity : 64;
         b->data = realloc(b->data, b->capacity);
@@ -32,11 +27,11 @@ static void buf_putc(Buffer *b, char c) {
     b->data[b->length++] = c;
 }
 
-static void buf_puts(Buffer *b, const char *s) {
+void buf_puts(Buffer *b, const char *s) {
     for (; *s != '\0'; s++) buf_putc(b, *s);
 }
 
-static void buf_int(Buffer *b, int64_t n) {
+void buf_int(Buffer *b, int64_t n) {
     char digits[24];
     snprintf(digits, sizeof digits, "%" PRId64, n);
     buf_puts(b, digits);
@@ -64,7 +59,7 @@ static void buf_utf8(Buffer *b, int64_t c) {
     }
 }
 
-static void buf_flush(Buffer *b, FILE *out) {
+void buf_flush(Buffer *b, FILE *out) {
     if (b->length > 0) fwrite(b->data, 1, b->length, out);
     free(b->data);
     b->data = NULL;
@@ -148,13 +143,18 @@ static void print_string(Buffer *b, Value v) {
 
 /* pretty=false is ~w (and io:write); pretty=true is ~p, minus the line
  * breaking Erlang does for long terms. */
-static void print_value(Buffer *b, Value v, bool pretty) {
+void print_value(Buffer *b, Value v, bool pretty) {
     switch (v.tag) {
     case ALKU_INT:
-        buf_int(b, v.as.integer);
+    case ALKU_BIG:
+    case ALKU_FLOAT:
+        print_number(b, v);
         break;
     case ALKU_ATOM:
         print_atom(b, v.as.atom);
+        break;
+    case ALKU_MAP:
+        print_map(b, v, pretty);
         break;
     case ALKU_FUN:
         /* "fun lists:map/2" for external funs, #Fun<...> for the rest */
@@ -205,7 +205,6 @@ static void print_value(Buffer *b, Value v, bool pretty) {
     }
 }
 
-static bool is_atom_named(Value v, const char *name);
 static char *c_string(Value chars);
 
 /* ---------- Exceptions ---------- */
@@ -253,11 +252,11 @@ _Noreturn void alku_raise(Value class, Value reason) {
     raise_keeping_info(class, reason);
 }
 
-static _Noreturn void raise_error(Value reason) {
+_Noreturn void raise_error(Value reason) {
     alku_raise(alku_atom("error"), reason);
 }
 
-static Value pair(const char *tag, Value v) {
+Value pair(const char *tag, Value v) {
     return alku_make_tuple(2, (Value[]){alku_atom(tag), v});
 }
 
@@ -268,22 +267,22 @@ Value alku_catch_value(Value class, Value reason) {
     return pair("EXIT", alku_make_tuple(2, (Value[]){reason, alku_nil()}));
 }
 
-static _Noreturn void badarith(void) {
+_Noreturn void badarith(void) {
     raise_error(alku_atom("badarith"));
 }
 
-static _Noreturn void overflow(void) {
+_Noreturn void system_limit(void) {
     raise_error(alku_atom("system_limit"));
 }
 
-static _Noreturn void badarg(Value v) {
+_Noreturn void badarg(Value v) {
     error_info.function = NULL;
     error_info.has_detail = true;
     error_info.detail = v;
     raise_keeping_info(alku_atom("error"), alku_atom("badarg"));
 }
 
-static Value array_to_list(size_t n, const Value *items) {
+Value array_to_list(size_t n, const Value *items) {
     Value list = alku_nil();
     while (n > 0) {
         n--;
@@ -327,7 +326,7 @@ static void describe_error(Buffer *b, Value reason) {
     if (is_atom_named(reason, "badarith")) {
         buf_puts(b, "an error occurred when evaluating an arithmetic expression");
     } else if (is_atom_named(reason, "system_limit")) {
-        buf_puts(b, "a system limit has been reached (Alku integers are 64-bit for now)");
+        buf_puts(b, "a system limit has been reached");
     } else if (is_atom_named(reason, "if_clause")) {
         buf_puts(b, "no true branch found when evaluating an if expression");
     } else if (is_atom_named(reason, "function_clause") && error_info.function != NULL) {
@@ -353,6 +352,15 @@ static void describe_error(Buffer *b, Value reason) {
         print_value(b, x, true);
     } else if (tagged(reason, "try_clause", &x)) {
         buf_puts(b, "no try clause matching ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "badkey", &x)) {
+        buf_puts(b, "bad key: ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "badmap", &x)) {
+        buf_puts(b, "bad map: ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "badrecord", &x)) {
+        buf_puts(b, "bad record ");
         print_value(b, x, true);
     } else if (tagged(reason, "badfun", &x)) {
         buf_puts(b, "bad function ");
@@ -485,7 +493,7 @@ static Value list_finish(ListBuilder *lb, Value tail) {
 
 /* UTF-8 bytes -> list of character codes. Input comes from the compiler
  * or from atom names, so it is valid UTF-8. */
-static Value utf8_to_list(const unsigned char *s, size_t length) {
+Value utf8_to_list(const unsigned char *s, size_t length) {
     ListBuilder lb = list_builder();
     size_t i = 0;
     while (i < length) {
@@ -510,7 +518,7 @@ Value alku_string(const char *utf8, size_t length) {
 
 /* ---------- Tests and accessors ---------- */
 
-static bool is_atom_named(Value v, const char *name) {
+bool is_atom_named(Value v, const char *name) {
     return v.tag == ALKU_ATOM && strcmp(v.as.atom, name) == 0;
 }
 
@@ -518,16 +526,43 @@ static int sign(int x) {
     return (x > 0) - (x < 0);
 }
 
-/* Erlang term order. Returns -1, 0 or 1. */
-static int compare(Value a, Value b) {
+/* Position in Erlang's term order; all numbers share one class. */
+static int term_class(AlkuTag tag) {
+    switch (tag) {
+    case ALKU_INT:
+    case ALKU_BIG:
+    case ALKU_FLOAT: return 0;
+    case ALKU_ATOM: return 1;
+    case ALKU_FUN: return 2;
+    case ALKU_PID: return 3;
+    case ALKU_TUPLE: return 4;
+    case ALKU_MAP: return 5;
+    case ALKU_NIL: return 6;
+    case ALKU_CONS: return 7;
+    case ALKU_PENDING: return 8;
+    }
+    return 8;
+}
+
+int compare_terms(Value a, Value b, bool exact) {
     for (;;) {
-        if (a.tag != b.tag) return a.tag < b.tag ? -1 : 1;
+        int ca = term_class(a.tag), cb = term_class(b.tag);
+        if (ca != cb) return ca < cb ? -1 : 1;
         switch (a.tag) {
         case ALKU_INT:
-        case ALKU_PID:
-            return (a.as.integer > b.as.integer) - (a.as.integer < b.as.integer);
+        case ALKU_BIG:
+        case ALKU_FLOAT: {
+            int c = compare_numbers(a, b);
+            /* =:= tells 1 and 1.0 apart; integers then come first */
+            if (c == 0 && exact && (a.tag == ALKU_FLOAT) != (b.tag == ALKU_FLOAT)) {
+                return a.tag == ALKU_FLOAT ? 1 : -1;
+            }
+            return c;
+        }
         case ALKU_ATOM:
             return sign(strcmp(a.as.atom, b.as.atom));
+        case ALKU_PID:
+            return (a.as.integer > b.as.integer) - (a.as.integer < b.as.integer);
         case ALKU_NIL:
         case ALKU_PENDING:
             return 0;
@@ -538,7 +573,7 @@ static int compare(Value a, Value b) {
                 return (uintptr_t)f->code < (uintptr_t)g->code ? -1 : 1;
             }
             for (size_t i = 0; i < f->free_count; i++) {
-                int c = compare(f->env[i], g->env[i]);
+                int c = compare_terms(f->env[i], g->env[i], exact);
                 if (c != 0) return c;
             }
             return 0;
@@ -547,13 +582,15 @@ static int compare(Value a, Value b) {
             size_t n = a.as.tuple->arity, m = b.as.tuple->arity;
             if (n != m) return n < m ? -1 : 1; /* smaller tuples come first */
             for (size_t i = 0; i < n; i++) {
-                int c = compare(a.as.tuple->elements[i], b.as.tuple->elements[i]);
+                int c = compare_terms(a.as.tuple->elements[i], b.as.tuple->elements[i], exact);
                 if (c != 0) return c;
             }
             return 0;
         }
+        case ALKU_MAP:
+            return compare_maps(a, b, exact);
         case ALKU_CONS: {
-            int c = compare(a.as.cons->head, b.as.cons->head);
+            int c = compare_terms(a.as.cons->head, b.as.cons->head, exact);
             if (c != 0) return c;
             a = a.as.cons->tail; /* loop instead of recursing on long lists */
             b = b.as.cons->tail;
@@ -564,7 +601,7 @@ static int compare(Value a, Value b) {
 }
 
 bool alku_exact_eq(Value a, Value b) {
-    return compare(a, b) == 0;
+    return compare_terms(a, b, true) == 0;
 }
 
 bool alku_is_true(Value v) {
@@ -593,67 +630,17 @@ Value alku_head(Value list) { return list.as.cons->head; }
 Value alku_tail(Value list) { return list.as.cons->tail; }
 Value alku_tuple_element(Value tuple, size_t index) { return tuple.as.tuple->elements[index]; }
 
-/* ---------- Arithmetic ---------- */
-
-static int64_t integer_arg(Value v) {
-    if (v.tag != ALKU_INT) badarith();
-    return v.as.integer;
-}
-
-Value alku_op_add(Value a, Value b) {
-    int64_t r;
-    if (__builtin_add_overflow(integer_arg(a), integer_arg(b), &r)) overflow();
-    return alku_int(r);
-}
-
-Value alku_op_sub(Value a, Value b) {
-    int64_t r;
-    if (__builtin_sub_overflow(integer_arg(a), integer_arg(b), &r)) overflow();
-    return alku_int(r);
-}
-
-Value alku_op_mul(Value a, Value b) {
-    int64_t r;
-    if (__builtin_mul_overflow(integer_arg(a), integer_arg(b), &r)) overflow();
-    return alku_int(r);
-}
-
-/* Erlang's div and rem truncate toward zero, exactly like C's / and %. */
-Value alku_op_div(Value a, Value b) {
-    int64_t x = integer_arg(a), y = integer_arg(b);
-    if (y == 0) badarith();
-    if (x == INT64_MIN && y == -1) overflow();
-    return alku_int(x / y);
-}
-
-Value alku_op_rem(Value a, Value b) {
-    int64_t x = integer_arg(a), y = integer_arg(b);
-    if (y == 0) badarith();
-    if (y == -1) return alku_int(0); /* avoids INT64_MIN % -1, which is undefined in C */
-    return alku_int(x % y);
-}
-
-Value alku_op_neg(Value a) {
-    int64_t x = integer_arg(a);
-    if (x == INT64_MIN) overflow();
-    return alku_int(-x);
-}
-
-Value alku_op_plus(Value a) {
-    return alku_int(integer_arg(a));
-}
-
 /* ---------- Comparison ---------- */
 
-/* == and =:= only differ for floats, which Alku does not have yet. */
-Value alku_op_eq(Value a, Value b) { return boolean(compare(a, b) == 0); }
-Value alku_op_ne(Value a, Value b) { return boolean(compare(a, b) != 0); }
-Value alku_op_exact_eq(Value a, Value b) { return boolean(compare(a, b) == 0); }
-Value alku_op_exact_ne(Value a, Value b) { return boolean(compare(a, b) != 0); }
-Value alku_op_lt(Value a, Value b) { return boolean(compare(a, b) < 0); }
-Value alku_op_gt(Value a, Value b) { return boolean(compare(a, b) > 0); }
-Value alku_op_le(Value a, Value b) { return boolean(compare(a, b) <= 0); }
-Value alku_op_ge(Value a, Value b) { return boolean(compare(a, b) >= 0); }
+/* == and < compare numbers by value (1 == 1.0); =:= does not. */
+Value alku_op_eq(Value a, Value b) { return boolean(compare_terms(a, b, false) == 0); }
+Value alku_op_ne(Value a, Value b) { return boolean(compare_terms(a, b, false) != 0); }
+Value alku_op_exact_eq(Value a, Value b) { return boolean(compare_terms(a, b, true) == 0); }
+Value alku_op_exact_ne(Value a, Value b) { return boolean(compare_terms(a, b, true) != 0); }
+Value alku_op_lt(Value a, Value b) { return boolean(compare_terms(a, b, false) < 0); }
+Value alku_op_gt(Value a, Value b) { return boolean(compare_terms(a, b, false) > 0); }
+Value alku_op_le(Value a, Value b) { return boolean(compare_terms(a, b, false) <= 0); }
+Value alku_op_ge(Value a, Value b) { return boolean(compare_terms(a, b, false) >= 0); }
 
 /* ---------- Boolean operators ---------- */
 
@@ -710,7 +697,7 @@ Value alku_op_subtract(Value a, Value b) {
     }
     for (Value v = b; v.tag == ALKU_CONS; v = v.as.cons->tail) {
         for (i = 0; i < n; i++) {
-            if (!removed[i] && compare(items[i], v.as.cons->head) == 0) {
+            if (!removed[i] && compare_terms(items[i], v.as.cons->head, true) == 0) {
                 removed[i] = true;
                 break;
             }
@@ -726,7 +713,7 @@ Value alku_op_subtract(Value a, Value b) {
 
 /* ---------- Built-in functions ---------- */
 
-Value alku_bif_is_integer(Value v) { return boolean(v.tag == ALKU_INT); }
+Value alku_bif_is_integer(Value v) { return boolean(is_integer_value(v)); }
 Value alku_bif_is_atom(Value v) { return boolean(v.tag == ALKU_ATOM); }
 Value alku_bif_is_list(Value v) { return boolean(v.tag == ALKU_NIL || v.tag == ALKU_CONS); }
 Value alku_bif_is_tuple(Value v) { return boolean(v.tag == ALKU_TUPLE); }
@@ -739,12 +726,6 @@ Value alku_bif_is_function_2(Value v, Value arity) {
 
 Value alku_bif_is_boolean(Value v) {
     return boolean(is_atom_named(v, "true") || is_atom_named(v, "false"));
-}
-
-Value alku_bif_abs(Value v) {
-    int64_t x = integer_arg(v);
-    if (x == INT64_MIN) overflow();
-    return alku_int(x < 0 ? -x : x);
 }
 
 Value alku_bif_hd(Value list) {
@@ -787,40 +768,9 @@ Value alku_bif_tuple_size(Value tuple) {
     return alku_int((int64_t)tuple.as.tuple->arity);
 }
 
-Value alku_bif_integer_to_list(Value n) {
-    if (n.tag != ALKU_INT) badarg(n);
-    char digits[24];
-    int length = snprintf(digits, sizeof digits, "%" PRId64, n.as.integer);
-    return utf8_to_list((const unsigned char *)digits, (size_t)length);
-}
-
 Value alku_bif_atom_to_list(Value atom) {
     if (atom.tag != ALKU_ATOM) badarg(atom);
     return utf8_to_list((const unsigned char *)atom.as.atom, strlen(atom.as.atom));
-}
-
-/* Decimal integer with an optional sign, like Erlang's list_to_integer/1. */
-Value alku_bif_list_to_integer(Value chars) {
-    int64_t n = 0;
-    bool negative = false, digits = false;
-    Value v = chars;
-    if (v.tag == ALKU_CONS && v.as.cons->head.tag == ALKU_INT &&
-        (v.as.cons->head.as.integer == '-' || v.as.cons->head.as.integer == '+')) {
-        negative = v.as.cons->head.as.integer == '-';
-        v = v.as.cons->tail;
-    }
-    for (; v.tag == ALKU_CONS; v = v.as.cons->tail) {
-        Value c = v.as.cons->head;
-        if (c.tag != ALKU_INT || c.as.integer < '0' || c.as.integer > '9') badarg(chars);
-        int64_t d = c.as.integer - '0';
-        if (__builtin_mul_overflow(n, 10, &n) ||
-            __builtin_add_overflow(n, negative ? -d : d, &n)) {
-            overflow();
-        }
-        digits = true;
-    }
-    if (v.tag != ALKU_NIL || !digits) badarg(chars);
-    return alku_int(n);
 }
 
 /* Atoms are never freed, as in Erlang. */
@@ -844,8 +794,21 @@ Value alku_bif_list_to_tuple(Value list) {
 }
 
 /* If the terms are equal, the first one is returned, as in Erlang. */
-Value alku_bif_max(Value a, Value b) { return compare(a, b) >= 0 ? a : b; }
-Value alku_bif_min(Value a, Value b) { return compare(a, b) <= 0 ? a : b; }
+Value alku_bif_max(Value a, Value b) { return compare_terms(a, b, false) >= 0 ? a : b; }
+Value alku_bif_min(Value a, Value b) { return compare_terms(a, b, false) <= 0 ? a : b; }
+
+/* is_record(R, Name, Size): what records compile to (erl_expand_records). */
+Value alku_bif_is_record_3(Value v, Value name, Value size) {
+    return boolean(v.tag == ALKU_TUPLE && size.tag == ALKU_INT &&
+                   v.as.tuple->arity == (uint64_t)size.as.integer && v.as.tuple->arity > 0 &&
+                   compare_terms(v.as.tuple->elements[0], name, true) == 0);
+}
+
+Value alku_bif_is_record_2(Value v, Value name) {
+    if (name.tag != ALKU_ATOM) badarg(name);
+    return boolean(v.tag == ALKU_TUPLE && v.as.tuple->arity > 0 &&
+                   compare_terms(v.as.tuple->elements[0], name, true) == 0);
+}
 
 Value alku_bif_apply_2(Value fun, Value args) {
     size_t n = proper_length(args);
@@ -953,46 +916,149 @@ static Value next_arg(Value *args, Value all) {
     return arg;
 }
 
-/* Supports ~w ~p ~s ~c ~b ~B ~n ~~ (no field widths yet). */
+static size_t utf8_length(const char *s, size_t n) {
+    size_t count = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (((unsigned char)s[i] & 0xC0) != 0x80) count++;
+    }
+    return count;
+}
+
+/* Keeps the first max characters of a UTF-8 buffer. */
+static void utf8_truncate(Buffer *b, size_t max) {
+    size_t count = 0;
+    for (size_t i = 0; i < b->length; i++) {
+        if (((unsigned char)b->data[i] & 0xC0) != 0x80 && count++ == max) {
+            b->length = i;
+            return;
+        }
+    }
+}
+
+/* The next character of a format string. */
+static int64_t next_format_char(Value *f, Value format) {
+    if (f->tag != ALKU_CONS || f->as.cons->head.tag != ALKU_INT) badarg(format);
+    int64_t c = f->as.cons->head.as.integer;
+    *f = f->as.cons->tail;
+    return c;
+}
+
+static int64_t small_int_arg(Value v) {
+    if (v.tag != ALKU_INT) badarg(v);
+    return v.as.integer;
+}
+
+static double float_arg(Value v) {
+    if (v.tag != ALKU_FLOAT) badarg(v); /* ~f and ~e need floats, as in Erlang */
+    return v.as.flt;
+}
+
+/* A field width or precision: digits, or * to take it from the arguments. */
+static int64_t format_number(int64_t *c, Value *f, Value format, Value *rest, Value args) {
+    int64_t n = -1;
+    if (*c == '*') {
+        n = small_int_arg(next_arg(rest, args));
+        *c = next_format_char(f, format);
+    } else if (*c >= '0' && *c <= '9') {
+        n = 0;
+        while (*c >= '0' && *c <= '9') {
+            if (n < 100000) n = n * 10 + (*c - '0');
+            *c = next_format_char(f, format);
+        }
+    }
+    return n;
+}
+
+/* Erlang control sequences: ~F.P.PadC with C one of
+ * w p s c b B f e i n ~. F is the field width (right-justified; -F or a
+ * negative * value left-justifies), P the precision, Pad the fill
+ * character. */
 static void format(Buffer *b, Value format, Value args) {
     Value f = format, rest = args;
     while (f.tag == ALKU_CONS) {
-        Value c = f.as.cons->head;
-        f = f.as.cons->tail;
-        if (c.tag != ALKU_INT || !is_char_code(c.as.integer)) badarg(format);
-        if (c.as.integer != '~') {
-            buf_utf8(b, c.as.integer);
+        int64_t c = next_format_char(&f, format);
+        if (!is_char_code(c)) badarg(format);
+        if (c != '~') {
+            buf_utf8(b, c);
             continue;
         }
-        if (f.tag != ALKU_CONS || f.as.cons->head.tag != ALKU_INT) badarg(format);
-        int64_t control = f.as.cons->head.as.integer;
-        f = f.as.cons->tail;
-        switch (control) {
-        case 'n': buf_putc(b, '\n'); break;
-        case '~': buf_putc(b, '~'); break;
-        case 'w': print_value(b, next_arg(&rest, args), false); break;
-        case 'p': print_value(b, next_arg(&rest, args), true); break;
-        case 's': {
-            Value arg = next_arg(&rest, args);
-            print_chars(b, arg, arg);
-            break;
+        c = next_format_char(&f, format);
+        bool left = false;
+        if (c == '-') {
+            left = true;
+            c = next_format_char(&f, format);
         }
+        int64_t width = format_number(&c, &f, format, &rest, args);
+        if (width < -1) {
+            left = true;
+            width = -width;
+        }
+        int64_t precision = -1, pad = ' ';
+        if (c == '.') {
+            c = next_format_char(&f, format);
+            precision = format_number(&c, &f, format, &rest, args);
+            if (c == '.') {
+                pad = next_format_char(&f, format);
+                c = next_format_char(&f, format);
+            }
+        }
+        while (c == 't' || c == 'l' || c == 'k') c = next_format_char(&f, format); /* modifiers */
+        if (c == 'n') {
+            buf_putc(b, '\n');
+            continue;
+        }
+        if (c == '~') {
+            buf_putc(b, '~');
+            continue;
+        }
+        Value arg = next_arg(&rest, args);
+        Buffer item = {0};
+        bool truncates = false;
+        switch (c) {
+        case 'w': print_value(&item, arg, false); break;
+        case 'p': print_value(&item, arg, true); break;
+        case 'i': continue; /* ignores its argument */
+        case 's':
+            print_chars(&item, arg, arg);
+            truncates = true;
+            break;
         case 'c': {
-            Value arg = next_arg(&rest, args);
             if (arg.tag != ALKU_INT || !is_char_code(arg.as.integer)) badarg(arg);
-            buf_utf8(b, arg.as.integer);
+            int64_t times = precision >= 0 ? precision : width >= 0 ? width : 1;
+            for (int64_t i = 0; i < times; i++) buf_utf8(&item, arg.as.integer);
             break;
         }
         case 'b':
         case 'B': {
-            Value arg = next_arg(&rest, args);
-            if (arg.tag != ALKU_INT) badarg(arg);
-            buf_int(b, arg.as.integer);
+            int64_t base = precision >= 0 ? precision : 10;
+            if (!is_integer_value(arg)) badarg(arg);
+            if (base < 2 || base > 36) badarg(format);
+            print_integer(&item, arg, (unsigned)base, c == 'b');
             break;
         }
+        case 'f': print_float_fixed(&item, float_arg(arg), precision >= 0 ? (int)precision : 6); break;
+        case 'e': print_float_scientific(&item, float_arg(arg), precision >= 0 ? (int)precision : 6); break;
         default:
             badarg(format);
         }
+        size_t length = utf8_length(item.data, item.length);
+        if (truncates && (precision >= 0 || width >= 0)) {
+            size_t max = (size_t)(precision >= 0 ? precision : width);
+            if (length > max) {
+                utf8_truncate(&item, max);
+                length = max;
+            }
+        }
+        if (width >= 0 && length > (size_t)width) { /* too long: Erlang fills with * */
+            item.length = 0;
+            for (int64_t i = 0; i < width; i++) buf_putc(&item, '*');
+            length = (size_t)width;
+        }
+        size_t padding = width >= 0 ? (size_t)width - length : 0;
+        if (!left) for (size_t i = 0; i < padding; i++) buf_utf8(b, pad);
+        for (size_t i = 0; i < item.length; i++) buf_putc(b, item.data[i]);
+        if (left) for (size_t i = 0; i < padding; i++) buf_utf8(b, pad);
+        free(item.data);
     }
     if (f.tag != ALKU_NIL || rest.tag != ALKU_NIL) badarg(args);
 }

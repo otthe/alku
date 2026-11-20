@@ -8,8 +8,8 @@
 
 -export([compile/2]).
 
--define(RUNTIME_HEADERS, ["alku_runtime.h", "alku_gc.h"]).
--define(RUNTIME_SOURCES, ["alku_runtime.c", "alku_gc.c"]).
+-define(RUNTIME_HEADERS, ["alku_runtime.h", "alku_internal.h", "alku_gc.h"]).
+-define(RUNTIME_SOURCES, ["alku_runtime.c", "alku_number.c", "alku_map.c", "alku_gc.c"]).
 
 -spec compile(file:filename(), file:filename()) -> ok | {error, string()}.
 compile(CFile, Exe) ->
@@ -28,7 +28,7 @@ compile(CFile, Exe) ->
 
 run_compiler(CC, CFile, Exe, RuntimeDir) ->
     Sources = [filename:join(RuntimeDir, Name) || Name <- ?RUNTIME_SOURCES],
-    Args = ["-std=c11", "-O2", "-pthread", "-I", RuntimeDir, "-o", Exe, CFile | Sources],
+    Args = ["-std=c11", "-O2", "-pthread", "-I", RuntimeDir, "-o", Exe, CFile | Sources] ++ ["-lm"],
     case alku_os:run(CC, Args) of
         {0, _} ->
             ok;

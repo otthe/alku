@@ -9,7 +9,7 @@
 #define LARGE_OBJECT ((size_t)16 * 1024) /* bigger objects get their own pages */
 #define MIN_THRESHOLD ((size_t)8 * 1024 * 1024)
 #define STRESS_THRESHOLD ((size_t)512)
-#define NUM_KINDS 3
+#define NUM_KINDS 5
 
 static const size_t size_classes[] = {
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
@@ -174,6 +174,8 @@ static void mark_value(Value v) {
     case ALKU_TUPLE: mark_address((uintptr_t)v.as.tuple); break;
     case ALKU_CONS: mark_address((uintptr_t)v.as.cons); break;
     case ALKU_FUN: mark_address((uintptr_t)v.as.fun); break;
+    case ALKU_BIG: mark_address((uintptr_t)v.as.big); break;
+    case ALKU_MAP: mark_address((uintptr_t)v.as.map); break;
     default: break;
     }
 }
@@ -199,6 +201,16 @@ static void trace(void *object) {
     case GC_FUN: {
         AlkuFun *fun = object;
         mark_values(fun->env, fun->free_count);
+        break;
+    }
+    case GC_BIG:
+        break;
+    case GC_MAP: {
+        AlkuMapNode *node = object;
+        mark_value(node->key);
+        mark_value(node->value);
+        mark_address((uintptr_t)node->left);
+        mark_address((uintptr_t)node->right);
         break;
     }
     }

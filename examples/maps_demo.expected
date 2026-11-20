@@ -1,0 +1,20 @@
+#{name => "Alku",version => 5}
+Alku
+#{name => "Alku",stable => false,version => 6}
+6 none 3
+{ok,"Alku"} error
+[{a,1},{b,2}]
+[1,2,3]
+#{"cat" => 1,"dog" => 1,"end" => 1,"the" => 3}
+6
+#{a => 10,b => 20}
+#{b => 2}
+#{x => 2,y => 4}
+[p,q]
+#{a => 1,b => 3} #{b => 2}
+#{a => 1,c => 3} #{b => 2}
+10000 99980001
+{circle,2} square
+true
+{missing,nope}
+false true

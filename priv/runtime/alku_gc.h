@@ -3,7 +3,7 @@
  *
  * A non-moving mark-and-sweep collector:
  * - Objects live in 64 KB pages; each page holds one kind of object
- *   (cons, tuple or fun) in fixed-size slots. Big objects get their own pages.
+ *   (cons, tuple, fun, big integer or map node) in fixed-size slots. Big objects get their own pages.
  * - Roots are found by scanning the C stack (and registers, via setjmp)
  *   conservatively: any word that points into a live slot keeps it alive.
  *   This means runtime and generated code never have to register values.
@@ -18,7 +18,9 @@
 typedef enum {
     GC_CONS,
     GC_TUPLE,
-    GC_FUN
+    GC_FUN,
+    GC_BIG,  /* big integer digits: nothing to trace */
+    GC_MAP   /* map tree node */
 } GcKind;
 
 /* stack_bottom: an address in the outermost frame that runs Alku code. */

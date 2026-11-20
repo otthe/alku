@@ -1,8 +1,9 @@
 %% @doc Reads Alku source code and checks it.
 %%
 %% Alku uses Erlang syntax, so it reuses Erlang's own tools: epp (the
-%% preprocessor and parser, which handles -define and macros) and erl_lint
-%% (which reports unbound variables, undefined functions and so on).
+%% preprocessor and parser, which handles -define and macros), erl_lint
+%% (which reports unbound variables, undefined functions and so on) and
+%% erl_expand_records (which turns records into plain tuples).
 -module(alku_frontend).
 
 -export([read/1, read_string/2]).
@@ -28,7 +29,7 @@ read_string(Name, Source) ->
             case parse_forms(split_forms(Tokens, []), []) of
                 {ok, Forms} ->
                     case lint(Name, Forms) of
-                        {ok, _, []} -> {ok, Forms};
+                        {ok, Expanded, []} -> {ok, Expanded};
                         {ok, _, Warnings} -> {error, Warnings};
                         {error, _} = Error -> Error
                     end;
@@ -55,7 +56,7 @@ parse_forms([Tokens | Rest], Acc) ->
 lint(File, Forms) ->
     case erl_lint:module(Forms, File) of
         {ok, Warnings} ->
-            {ok, Forms, messages(Warnings, "Warning: ")};
+            {ok, erl_expand_records:module(Forms, []), messages(Warnings, "Warning: ")};
         {error, Errors, Warnings} ->
             {error, messages(Errors, "") ++ messages(Warnings, "Warning: ")}
     end.

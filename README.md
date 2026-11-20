@@ -42,10 +42,11 @@ alku c FILE.erl                   # show the generated C code
 you can put it on your PATH, e.g.
 `ln -s "$PWD/_build/default/bin/alku" ~/.local/bin/alku`.
 
-## What works now (phase 4)
+## What works now (phase 5)
 
-- Integers (64-bit; overflow is a runtime error), atoms, tuples, lists,
-  strings (lists of character codes, as in Erlang) and funs
+- Integers of any size (small ones are fast; big ones grow as needed),
+  floats, atoms, tuples, lists, strings (lists of character codes, as in
+  Erlang), maps, records and funs
 - Functions with multiple clauses, pattern matching and guards (`,` and `;`)
 - Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`, `P1 = P2`,
   repeated variables
@@ -65,14 +66,28 @@ you can put it on your PATH, e.g.
   runs in constant stack space. Non-tail recursion can go very deep too:
   programs run on a 512 MB stack.
 - **Garbage collection**: memory that is no longer used is reclaimed
-- Operators: `+ - * div rem`, comparisons (full Erlang term order),
+- Operators: `+ - * / div rem`, `band bor bxor bnot bsl bsr`, comparisons
+  (full Erlang term order; `1 == 1.0` but not `1 =:= 1.0`),
   `and or xor not andalso orelse`, `++ --`
+- Maps: `#{K => V}`, `M#{K := V}`, patterns `#{K := V}`, map
+  comprehensions `#{K => V || K := V <- M}` and map generators in list
+  comprehensions
+- Records: `-record`, `#r{}`, `R#r.f`, `R#r{f = V}`, record patterns,
+  `record_info/2`, `is_record/2` (expanded into tuples by Erlang's own
+  `erl_expand_records`)
 - Built-ins: `is_integer/1`, `is_atom/1`, `is_boolean/1`, `is_list/1`,
   `is_tuple/1`, `is_function/1,2`, `abs/1`, `hd/1`, `tl/1`, `length/1`,
   `element/2`, `setelement/3`, `tuple_size/1`, `integer_to_list/1`,
   `atom_to_list/1`, `list_to_integer/1`, `list_to_atom/1`,
   `tuple_to_list/1`, `list_to_tuple/1`, `max/2`, `min/2`, `apply/2`,
-  `halt/0,1`
+  `halt/0,1`, `is_float/1`, `is_number/1`, `float/1`, `round/1`,
+  `trunc/1`, `floor/1`, `ceil/1`, `float_to_list/1,2`, `list_to_float/1`,
+  `integer_to_list/2`, `list_to_integer/2`, `is_map/1`, `map_size/1`,
+  `is_map_key/2`, `map_get/2`
+- `math`: `pi sqrt pow exp log log2 log10 sin cos tan asin acos atan atan2
+  floor ceil`
+- `maps`: `new get put update remove is_key find keys values to_list
+  from_list size merge fold map filter foreach update_with with without`
 - Programs: `main/1` receives the command-line arguments as strings
   (`main/0` also works)
 - I/O: `io:format/1,2,3`, `io:put_chars/1,2`, `io:write/1,2`,
@@ -82,22 +97,29 @@ you can put it on your PATH, e.g.
   foldr foreach last map max member min nth reverse seq sort sum zip`
 - Standard library `string`: `is_empty join lowercase split tokens
   to_lower to_upper trim uppercase`
-- `io:format` controls: `~w ~p ~s ~c ~b ~B ~n ~~` (no field widths)
+- `io:format` controls: `~w ~p ~s ~c ~b ~B ~f ~e ~i ~n ~~` with field
+  width, precision and padding (`~5B`, `~-10s`, `~.2f`, `~2..0B`, `~.16B`)
 - Erlang-style runtime errors (`no function clause matching f(5)`, ...)
 - Compile errors and warnings from Erlang's own linter
 
 Programs that use only these features are also valid Erlang and print
-the same output under `erl`. One difference: `~p` never breaks long
-terms over several lines.
+the same output under `erl`. Differences: `~p` never breaks long terms
+over several lines, and maps with more than 32 keys print in key order
+(Erlang uses hash order for those).
 
-Not yet: floats, maps, binaries (so no `file:read_file/1`), records,
-big integers, stack traces, `"abc" ++ Rest` patterns, programs made of
-several modules.
+Not yet: binaries (so no `file:read_file/1`), stack traces,
+`"abc" ++ Rest` patterns, `~g`, programs made of several modules.
 
 ## How the runtime works
 
 - **Values** are small C structs passed by value: a tag plus an integer,
-  an atom name or a pointer to a heap object (tuple, list cell, fun).
+  a float, an atom name or a pointer to a heap object (big integer,
+  tuple, list cell, fun, map node).
+- **Numbers** (`alku_number.c`): integers that fit in 64 bits are stored
+  inline; results that don't become big integers (32-bit limbs, Knuth's
+  long division). Floats print exactly as Erlang prints them.
+- **Maps** (`alku_map.c`): persistent weight-balanced trees, so an update
+  costs O(log n) and never changes the old map.
 - **Calls**: every Alku function and fun body is a C function taking its
   arguments as an array. A call in tail position to the function itself
   becomes a `goto` back to its start. Any other tail call returns a
@@ -123,7 +145,7 @@ several modules.
 | `src/alku_os.erl` | Runs programs, makes temporary file names |
 | `src/alku_priv.erl` | Reads files from `priv/` (also inside the escript) |
 | `src/alku_stdlib.erl` | Loads the standard library modules |
-| `priv/runtime/` | The C runtime: values, operators, calls, errors, GC |
+| `priv/runtime/` | The C runtime: values, numbers, maps, calls, errors, GC |
 | `priv/stdlib/` | The standard library, written in Alku |
 | `test/` | Unit tests |
 | `examples/` | Example programs with their expected output (also tests) |

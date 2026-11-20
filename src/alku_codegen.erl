@@ -159,6 +159,9 @@ pattern({cons, _, Head, Tail}, Subject, Fail, St0) ->
     {[check(["alku_is_cons(", Subject, ")"], Fail), Code], St1};
 pattern({string, Anno, Chars}, Subject, Fail, St) ->
     pattern(string_to_list_pattern(Chars, Anno), Subject, Fail, St);
+pattern({map, _, Fields}, Subject, Fail, St0) ->
+    {Code, St1} = map_pattern(Fields, Subject, Fail, St0),
+    {[check(["alku_is_map(", Subject, ")"], Fail), Code], St1};
 pattern({match, _, P1, P2}, Subject, Fail, St0) ->
     {Code1, St1} = pattern(P1, Subject, Fail, St0),
     {Code2, St2} = pattern(P2, Subject, Fail, St1),
@@ -170,6 +173,19 @@ pattern(P, Subject, Fail, St) ->
         error ->
             unsupported(P)
     end.
+
+%% #{Key := Pattern, ...}: each key must be present and its value match.
+map_pattern([], _Subject, _Fail, St) ->
+    {[], St};
+map_pattern([{map_field_exact, _, Key, ValuePattern} | Rest], Subject, Fail, St0) ->
+    {KeyCode, KeyRef, St1} = expr(Key, St0),
+    {Found, St2} = fresh("map_value", St1),
+    {ValueCode, St3} = pattern(ValuePattern, Found, Fail, St2),
+    {RestCode, St4} = map_pattern(Rest, Subject, Fail, St3),
+    {[KeyCode,
+      "Value ", Found, ";\n",
+      check(["alku_map_lookup(", Subject, ", ", KeyRef, ", &", Found, ")"], Fail),
+      ValueCode, RestCode], St4}.
 
 %% "abc" in a pattern means [$a, $b, $c].
 string_to_list_pattern([], Anno) ->
@@ -236,7 +252,8 @@ boolean_safe(_) ->
     false.
 
 type_test(F) ->
-    lists:member(F, [is_integer, is_atom, is_boolean, is_list, is_tuple, is_function]).
+    lists:member(F, [is_integer, is_float, is_number, is_atom, is_boolean, is_list,
+                     is_tuple, is_map, is_function]).
 
 %% Expressions whose evaluation cannot raise.
 total({var, _, _}) -> true;
@@ -404,6 +421,7 @@ exports(E, St0) ->
 vars_outside_funs({'fun', _, _}) -> [];
 vars_outside_funs({named_fun, _, _, _}) -> [];
 vars_outside_funs({lc, _, _, _}) -> [];
+vars_outside_funs({mc, _, _, _}) -> [];
 vars_outside_funs(T) when element(1, T) =:= var -> vars_in(T);
 vars_outside_funs(T) when is_tuple(T) -> vars_outside_funs(tuple_to_list(T));
 vars_outside_funs(L) when is_list(L) -> lists:flatmap(fun vars_outside_funs/1, L);
@@ -522,6 +540,20 @@ compound({'catch', _, E}, St0) ->
       "} else {\n",
       R, " = alku_catch_value(alku_caught_class(), alku_caught_reason());\n",
       "}\n"], R, St3#st{vars = St2#st.vars}};
+compound({map, _, Fields}, St) ->
+    map_fields("alku_map_new()", Fields, St);
+compound({map, _, Map, []}, St0) ->
+    {Code, Ref, St1} = expr(Map, St0),
+    {CodeT, T, St2} = temp(["alku_map_check(", Ref, ")"], St1),
+    {[Code, CodeT], T, St2};
+compound({map, _, Map, Fields}, St0) ->
+    {Code, Ref, St1} = expr(Map, St0),
+    {Rest, T, St2} = map_fields(Ref, Fields, St1),
+    {[Code, Rest], T, St2};
+compound({mc, Anno, {map_field_assoc, _, Key, Value}, Qualifiers}, St) ->
+    %% #{K => V || ...} is maps:from_list([{K, V} || ...])
+    Pairs = {lc, Anno, {tuple, Anno, [Key, Value]}, Qualifiers},
+    expr({call, Anno, {remote, Anno, {atom, Anno, maps}, {atom, Anno, from_list}}, [Pairs]}, St);
 compound({lc, Anno, Template, Qualifiers}, St0) ->
     {Loop, St1} = list_comprehension(Template, Qualifiers, {nil, Anno}, St0),
     expr({call, Anno, {remote, Anno, {atom, Anno, lists}, {atom, Anno, reverse}}, [Loop]}, St1);
@@ -556,6 +588,19 @@ compound({named_fun, _, Name, Clauses}, St) ->
     lambda(Name, Clauses, St);
 compound(E, _St) ->
     unsupported(E).
+
+%% Map#{K => V, K2 := V2}: => inserts or replaces, := requires the key.
+map_fields(Base, [], St) ->
+    {[], Base, St};
+map_fields(Base, [{Kind, _, Key, Value} | Rest], St0) ->
+    {Codes, [KeyRef, ValueRef], St1} = exprs([Key, Value], St0),
+    Fun = case Kind of
+              map_field_assoc -> "alku_map_put";
+              map_field_exact -> "alku_map_update"
+          end,
+    {CodeT, T, St2} = temp([Fun, "(", Base, ", ", KeyRef, ", ", ValueRef, ")"], St1),
+    {RestCode, Result, St3} = map_fields(T, Rest, St2),
+    {[Codes, CodeT, RestCode], Result, St3}.
 
 %% A body whose value is needed; variables it binds stay visible.
 sequence([E], St) ->
@@ -598,6 +643,10 @@ list_comprehension(Template, [{generate, A, Pattern, List} | Qs], Acc, St0) ->
              [{call, A, Loop, [Tail, LoopAcc]}]},
             {clause, A, [{nil, A}, LoopAcc], [], [LoopAcc]}]},
     {{call, A, Fun, [List, Acc]}, St4};
+list_comprehension(Template, [{m_generate, A, {map_field_exact, _, K, V}, Map} | Qs], Acc, St) ->
+    %% K := V <- Map loops over maps:to_list(Map)
+    ToList = {call, A, {remote, A, {atom, A, maps}, {atom, A, to_list}}, [Map]},
+    list_comprehension(Template, [{generate, A, {tuple, A, [K, V]}, ToList} | Qs], Acc, St);
 list_comprehension(Template, [Filter | Qs], Acc, St0) ->
     A = element(2, Filter),
     {Inner, St1} = list_comprehension(Template, Qs, Acc, St0),
@@ -701,18 +750,21 @@ rename(X, _Old, _New) -> X.
 literal({integer, Anno, N}) -> {ok, int_literal(N, Anno)};
 literal({char, Anno, C}) -> {ok, int_literal(C, Anno)};
 literal({op, Anno, '-', {integer, _, N}}) -> {ok, int_literal(-N, Anno)};
+literal({float, _, F}) -> {ok, float_literal(F)};
+literal({op, _, '-', {float, _, F}}) -> {ok, float_literal(-F)};
 literal({atom, _, A}) -> {ok, ["alku_atom(", string_literal(atom_to_list(A)), ")"]};
 literal({nil, _}) -> {ok, "alku_nil()"};
 literal(_) -> error.
 
-int_literal(N, Anno) ->
+int_literal(N, _Anno) ->
     case alku_c:fits_int64(N) of
-        true ->
-            ["alku_int(", alku_c:int64_literal(N), ")"];
-        false ->
-            fail(Anno, io_lib:format("integer ~b does not fit in 64 bits "
-                                     "(big integers are not supported yet)", [N]))
+        true -> ["alku_int(", alku_c:int64_literal(N), ")"];
+        false -> ["alku_integer_literal(\"", integer_to_list(N), "\")"]
     end.
+
+%% 17 significant digits always read back as the same double.
+float_literal(F) ->
+    ["alku_float(", io_lib:format("~.17e", [F]), ")"].
 
 string_literal(Chars) ->
     alku_c:string_literal(unicode:characters_to_binary(Chars)).
@@ -735,14 +787,19 @@ binary_op('or', _) -> "alku_op_or";
 binary_op('xor', _) -> "alku_op_xor";
 binary_op('++', _) -> "alku_op_append";
 binary_op('--', _) -> "alku_op_subtract";
-binary_op('/', Anno) ->
-    fail(Anno, "the / operator needs floats, which are not supported yet; use div");
+binary_op('/', _) -> "alku_op_fdiv";
+binary_op('band', _) -> "alku_op_band";
+binary_op('bor', _) -> "alku_op_bor";
+binary_op('bxor', _) -> "alku_op_bxor";
+binary_op('bsl', _) -> "alku_op_bsl";
+binary_op('bsr', _) -> "alku_op_bsr";
 binary_op(Op, Anno) ->
     fail(Anno, io_lib:format("the ~s operator is not supported yet", [Op])).
 
 unary_op('-', _) -> "alku_op_neg";
 unary_op('+', _) -> "alku_op_plus";
 unary_op('not', _) -> "alku_op_not";
+unary_op('bnot', _) -> "alku_op_bnot";
 unary_op(Op, Anno) ->
     fail(Anno, io_lib:format("the ~s operator is not supported yet", [Op])).
 
@@ -764,6 +821,54 @@ builtin(erlang, tuple_size, 1, _) -> "alku_bif_tuple_size";
 builtin(erlang, integer_to_list, 1, _) -> "alku_bif_integer_to_list";
 builtin(erlang, atom_to_list, 1, _) -> "alku_bif_atom_to_list";
 builtin(erlang, list_to_integer, 1, _) -> "alku_bif_list_to_integer";
+builtin(erlang, list_to_integer, 2, _) -> "alku_bif_list_to_integer_2";
+builtin(erlang, integer_to_list, 2, _) -> "alku_bif_integer_to_list_2";
+builtin(erlang, is_float, 1, _) -> "alku_bif_is_float";
+builtin(erlang, is_number, 1, _) -> "alku_bif_is_number";
+builtin(erlang, float, 1, _) -> "alku_bif_float";
+builtin(erlang, round, 1, _) -> "alku_bif_round";
+builtin(erlang, trunc, 1, _) -> "alku_bif_trunc";
+builtin(erlang, floor, 1, _) -> "alku_bif_floor";
+builtin(erlang, ceil, 1, _) -> "alku_bif_ceil";
+builtin(erlang, float_to_list, 1, _) -> "alku_bif_float_to_list_1";
+builtin(erlang, float_to_list, 2, _) -> "alku_bif_float_to_list_2";
+builtin(erlang, list_to_float, 1, _) -> "alku_bif_list_to_float";
+builtin(erlang, is_map, 1, _) -> "alku_bif_is_map";
+builtin(erlang, map_size, 1, _) -> "alku_bif_map_size";
+builtin(erlang, is_map_key, 2, _) -> "alku_bif_is_map_key";
+builtin(erlang, map_get, 2, _) -> "alku_bif_map_get";
+builtin(erlang, is_record, 2, _) -> "alku_bif_is_record_2";
+builtin(erlang, is_record, 3, _) -> "alku_bif_is_record_3";
+builtin(math, pi, 0, _) -> "alku_math_pi";
+builtin(math, sqrt, 1, _) -> "alku_math_sqrt";
+builtin(math, pow, 2, _) -> "alku_math_pow";
+builtin(math, exp, 1, _) -> "alku_math_exp";
+builtin(math, log, 1, _) -> "alku_math_log";
+builtin(math, log2, 1, _) -> "alku_math_log2";
+builtin(math, log10, 1, _) -> "alku_math_log10";
+builtin(math, sin, 1, _) -> "alku_math_sin";
+builtin(math, cos, 1, _) -> "alku_math_cos";
+builtin(math, tan, 1, _) -> "alku_math_tan";
+builtin(math, asin, 1, _) -> "alku_math_asin";
+builtin(math, acos, 1, _) -> "alku_math_acos";
+builtin(math, atan, 1, _) -> "alku_math_atan";
+builtin(math, atan2, 2, _) -> "alku_math_atan2";
+builtin(math, floor, 1, _) -> "alku_math_floor";
+builtin(math, ceil, 1, _) -> "alku_math_ceil";
+builtin(maps, new, 0, _) -> "alku_maps_new";
+builtin(maps, get, 2, _) -> "alku_maps_get_2";
+builtin(maps, get, 3, _) -> "alku_maps_get_3";
+builtin(maps, put, 3, _) -> "alku_maps_put";
+builtin(maps, update, 3, _) -> "alku_maps_update";
+builtin(maps, remove, 2, _) -> "alku_maps_remove";
+builtin(maps, is_key, 2, _) -> "alku_maps_is_key";
+builtin(maps, find, 2, _) -> "alku_maps_find";
+builtin(maps, keys, 1, _) -> "alku_maps_keys";
+builtin(maps, values, 1, _) -> "alku_maps_values";
+builtin(maps, to_list, 1, _) -> "alku_maps_to_list";
+builtin(maps, from_list, 1, _) -> "alku_maps_from_list";
+builtin(maps, size, 1, _) -> "alku_maps_size";
+builtin(maps, merge, 2, _) -> "alku_maps_merge";
 builtin(erlang, list_to_atom, 1, _) -> "alku_bif_list_to_atom";
 builtin(erlang, tuple_to_list, 1, _) -> "alku_bif_tuple_to_list";
 builtin(erlang, list_to_tuple, 1, _) -> "alku_bif_list_to_tuple";
@@ -815,10 +920,6 @@ temp(CExpr, St0) ->
 
 unsupported(E) ->
     What = case element(1, E) of
-               float -> "floats are";
-               map -> "maps are";
-               map_field_assoc -> "maps are";
-               record -> "records are";
                bin -> "binaries are";
                'receive' -> "receive expressions are (Alku has no processes)";
                _ -> "this kind of expression or pattern is"

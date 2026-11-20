@@ -21,13 +21,17 @@
 #include <stdint.h>
 
 /* Tags are declared in Erlang term order:
- * number < atom < fun < pid < tuple < nil < list. */
+ * number < atom < fun < pid < tuple < map < nil < list.
+ * The three number tags compare by numeric value. */
 typedef enum {
-    ALKU_INT,
+    ALKU_INT,   /* integer that fits in 64 bits */
+    ALKU_BIG,   /* any other integer (on the heap) */
+    ALKU_FLOAT,
     ALKU_ATOM,
     ALKU_FUN,
     ALKU_PID, /* an open file, like the pids Erlang uses for files */
     ALKU_TUPLE,
+    ALKU_MAP,
     ALKU_NIL,
     ALKU_CONS,
     ALKU_PENDING /* not a term: marks a pending tail call */
@@ -36,15 +40,20 @@ typedef enum {
 typedef struct AlkuTuple AlkuTuple;
 typedef struct AlkuCons AlkuCons;
 typedef struct AlkuFun AlkuFun;
+typedef struct AlkuBig AlkuBig;
+typedef struct AlkuMapNode AlkuMapNode;
 
 typedef struct {
     AlkuTag tag;
     union {
         int64_t integer;
+        double flt;
         const char *atom; /* UTF-8 name; atoms are compared by name */
+        AlkuBig *big;
         AlkuTuple *tuple;
         AlkuCons *cons;
         AlkuFun *fun;
+        AlkuMapNode *map; /* root of a balanced tree; NULL for #{} */
     } as;
 } Value;
 
@@ -53,6 +62,22 @@ typedef Value (*AlkuCode)(const Value *args, AlkuFun *self);
 struct AlkuTuple {
     size_t arity;
     Value elements[];
+};
+
+/* A big integer: sign and magnitude in 32-bit limbs, least significant
+ * first. Never holds a value that fits in an int64. */
+struct AlkuBig {
+    size_t length;
+    bool negative;
+    uint32_t limbs[];
+};
+
+/* A map is a persistent weight-balanced binary tree ordered by key. */
+struct AlkuMapNode {
+    size_t size; /* nodes in this subtree */
+    Value key;
+    Value value;
+    AlkuMapNode *left, *right;
 };
 
 /* One list cell: [head | tail] */
@@ -105,6 +130,8 @@ static inline Value alku_settle(Value v) {
 
 /* Constructors */
 Value alku_int(int64_t n);
+Value alku_float(double d);
+Value alku_integer_literal(const char *decimal); /* for integers beyond 64 bits */
 Value alku_atom(const char *name);
 Value alku_nil(void);
 Value alku_cons(Value head, Value tail);
@@ -132,8 +159,15 @@ Value alku_op_sub(Value a, Value b);
 Value alku_op_mul(Value a, Value b);
 Value alku_op_div(Value a, Value b);
 Value alku_op_rem(Value a, Value b);
+Value alku_op_fdiv(Value a, Value b); /* / */
 Value alku_op_neg(Value a);
 Value alku_op_plus(Value a);
+Value alku_op_band(Value a, Value b);
+Value alku_op_bor(Value a, Value b);
+Value alku_op_bxor(Value a, Value b);
+Value alku_op_bsl(Value a, Value b);
+Value alku_op_bsr(Value a, Value b);
+Value alku_op_bnot(Value a);
 
 Value alku_op_eq(Value a, Value b);
 Value alku_op_ne(Value a, Value b);
@@ -152,6 +186,14 @@ Value alku_op_not(Value a);
 Value alku_op_append(Value a, Value b);   /* ++ */
 Value alku_op_subtract(Value a, Value b); /* -- */
 
+/* Maps */
+Value alku_map_new(void);
+Value alku_map_put(Value map, Value key, Value value);    /* M#{K => V} */
+Value alku_map_update(Value map, Value key, Value value); /* M#{K := V} */
+Value alku_map_check(Value map);                          /* M#{} */
+bool alku_is_map(Value v);
+bool alku_map_lookup(Value map, Value key, Value *value);  /* for patterns */
+
 /* Built-in functions */
 Value alku_bif_is_integer(Value v);
 Value alku_bif_is_atom(Value v);
@@ -161,6 +203,54 @@ Value alku_bif_is_tuple(Value v);
 Value alku_bif_is_function_1(Value v);
 Value alku_bif_is_function_2(Value v, Value arity);
 Value alku_bif_abs(Value v);
+Value alku_bif_is_float(Value v);
+Value alku_bif_is_number(Value v);
+Value alku_bif_float(Value v);
+Value alku_bif_round(Value v);
+Value alku_bif_trunc(Value v);
+Value alku_bif_floor(Value v);
+Value alku_bif_ceil(Value v);
+Value alku_bif_float_to_list_1(Value f);
+Value alku_bif_float_to_list_2(Value f, Value options);
+Value alku_bif_list_to_float(Value chars);
+Value alku_bif_integer_to_list_2(Value n, Value base);
+Value alku_bif_list_to_integer_2(Value chars, Value base);
+Value alku_bif_is_record_2(Value v, Value name);
+Value alku_bif_is_record_3(Value v, Value name, Value size);
+Value alku_bif_is_map(Value v);
+Value alku_bif_map_size(Value map);
+Value alku_bif_is_map_key(Value key, Value map);
+Value alku_bif_map_get(Value key, Value map);
+Value alku_maps_new(void);
+Value alku_maps_get_2(Value key, Value map);
+Value alku_maps_get_3(Value key, Value map, Value fallback);
+Value alku_maps_put(Value key, Value value, Value map);
+Value alku_maps_update(Value key, Value value, Value map);
+Value alku_maps_remove(Value key, Value map);
+Value alku_maps_is_key(Value key, Value map);
+Value alku_maps_find(Value key, Value map);
+Value alku_maps_keys(Value map);
+Value alku_maps_values(Value map);
+Value alku_maps_to_list(Value map);
+Value alku_maps_from_list(Value list);
+Value alku_maps_size(Value map);
+Value alku_maps_merge(Value a, Value b);
+Value alku_math_pi(void);
+Value alku_math_sqrt(Value x);
+Value alku_math_pow(Value x, Value y);
+Value alku_math_exp(Value x);
+Value alku_math_log(Value x);
+Value alku_math_log2(Value x);
+Value alku_math_log10(Value x);
+Value alku_math_sin(Value x);
+Value alku_math_cos(Value x);
+Value alku_math_tan(Value x);
+Value alku_math_asin(Value x);
+Value alku_math_acos(Value x);
+Value alku_math_atan(Value x);
+Value alku_math_atan2(Value y, Value x);
+Value alku_math_floor(Value x);
+Value alku_math_ceil(Value x);
 Value alku_bif_hd(Value list);
 Value alku_bif_tl(Value list);
 Value alku_bif_length(Value list);

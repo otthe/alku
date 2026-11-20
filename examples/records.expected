@@ -1,0 +1,6 @@
+{person,"Ada",36,none}
+Ada is 36
+37 true
+{person,"Bo",0,none} false
+["Ada","Bo"]
+[name,age,email] true 3
