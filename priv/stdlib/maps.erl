@@ -3,8 +3,8 @@
 %% into the C runtime.
 -module(maps).
 
--export([filter/2, fold/3, foreach/2, map/2, update_with/3, update_with/4,
-         with/2, without/2]).
+-export([filter/2, fold/3, foreach/2, from_keys/2, map/2, take/2, update_with/3,
+         update_with/4, with/2, without/2]).
 
 %% F(Key, Value, Acc) for every entry, in key order.
 fold(F, Acc, Map) ->
@@ -31,6 +31,15 @@ update_with(Key, F, Init, Map) ->
 
 with(Keys, Map) ->
     maps:from_list([{K, V} || K <- Keys, {ok, V} <- [maps:find(K, Map)]]).
+
+%% {Value, MapWithoutKey}, or error
+take(Key, Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> {Value, maps:remove(Key, Map)};
+        error -> error
+    end.
+
+from_keys(Keys, Value) -> maps:from_list([{K, Value} || K <- Keys]).
 
 without(Keys, Map) ->
     lists:foldl(fun(K, M) -> maps:remove(K, M) end, Map, Keys).

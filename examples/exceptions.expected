@@ -12,3 +12,4 @@ cleanup done
 no_such_element
 {badmatch,{error,1}}
 ** exception error: unhandled
+     in function  exceptions:main/0 (examples/exceptions.erl, line 46)

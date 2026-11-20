@@ -15,6 +15,9 @@
 %% - Exceptions use setjmp/longjmp: try pushes a handler and raising jumps
 %%   to the innermost one (see AlkuHandler in alku_runtime.h).
 %%
+%% Stack traces: each C function keeps an AlkuFrame while it runs and sets
+%% frame.line before anything that can raise; returning leaves the frame.
+%%
 %% Tail calls: in `tail` position, a call to the function being compiled
 %% becomes a jump back to its start, and any other call to an Alku
 %% function or fun returns a pending tail call to the caller's
@@ -31,6 +34,7 @@
     exports :: #{{module(), atom(), arity()} => true}, % ... and the exported ones
     imports = #{} :: #{{atom(), arity()} => module()}, % -import of this module
     modules :: #{module() => true},                 % modules of the program
+    file = "" :: string(),                          % source file of this module
     module :: module(),
     cname :: string(),                % the C function being compiled
     arity :: arity(),                 % ... and its arity
@@ -58,7 +62,8 @@ program([{Main, _} | _] = Modules) ->
                                      {attribute, _, export, Es} <- Forms, {F, A} <- Es]),
         Program = #st{funs = Funs, exports = Exports,
                       modules = maps:from_list([{M, true} || {M, _} <- Modules])},
-        Compiled = lists:append([compile_function(M, F, imports(Forms), Program)
+        Compiled = lists:append([compile_function(M, F, imports(Forms),
+                                                  Program#st{file = file_of(M, Forms)})
                                  || {M, Forms} <- Modules,
                                     {function, _, _, _, _} = F <- Forms]),
         {Prototypes, Definitions} = lists:unzip(Compiled),
@@ -77,6 +82,13 @@ program([{Main, _} | _] = Modules) ->
     end.
 
 %% ---------- Functions ----------
+
+%% epp records the source file as the first attribute.
+file_of(Module, Forms) ->
+    case [F || {attribute, _, file, {F, _}} <- Forms] of
+        [File | _] -> File;
+        [] -> "stdlib/" ++ atom_to_list(Module) ++ ".erl"
+    end.
 
 imports(Forms) ->
     maps:from_list([{{F, A}, From} || {attribute, _, import, {From, Fs}} <- Forms, {F, A} <- Fs]).
@@ -100,21 +112,40 @@ function(Module, {function, _, Name, Arity, Clauses}, Program) ->
 %% runs once; a self tail call jumps back to tail_entry.
 c_function(ErrorName, Prologue, Clauses, #st{cname = CName, arity = Arity} = St0) ->
     Params = params(Arity),
+    [{clause, Anno, _, _, _} | _] = Clauses,
     Entry = [["Value ", P, " = args[", integer_to_list(I - 1), "];\n"]
              || {I, P} <- lists:zip(lists:seq(1, Arity), Params)],
-    NoMatch = ["alku_error_function_clause(", string_literal(ErrorName), ", ",
+    NoMatch = [at(Anno),
+               "alku_error_function_clause(", string_literal(ErrorName), ", ",
                integer_to_list(Arity), ", ", value_array(Params), ");\n"],
     {Body, St1} = clauses(Clauses, Params, tail, NoMatch, St0),
+    Info = "info_" ++ CName,
     Header = ["static Value ", CName, "(const Value *args, AlkuFun *self)"],
+    Prototype = ["static const AlkuFunctionInfo ", Info, " = {",
+                 string_literal(atom_to_list(St0#st.module)), ", ", string_literal(ErrorName), ", ",
+                 integer_to_list(Arity), ", ", string_literal(St0#st.file), "};\n",
+                 Header, ";\n"],
     Definition = [Header, " {\n",
                   Entry,
                   "(void)args;\n",
                   "(void)self;\n",
+                  "AlkuFrame frame;\n",
+                  "alku_enter(&frame, &", Info, ", ", integer_to_list(line(Anno)), ");\n",
                   Prologue,
                   "tail_entry: ;\n",
                   Body,
                   "}\n\n"],
-    {[Header, ";\n"], Definition, St1}.
+    {Prototype, Definition, St1}.
+
+line(Anno) ->
+    case erl_anno:line(Anno) of
+        L when is_integer(L) -> L;
+        _ -> 0
+    end.
+
+%% Records the line about to run, for stack traces.
+at(Anno) ->
+    ["frame.line = ", integer_to_list(line(Anno)), ";\n"].
 
 params(Arity) ->
     ["a" ++ integer_to_list(I) || I <- lists:seq(1, Arity)].
@@ -352,13 +383,13 @@ body([E | Es], K, St0) ->
     {[Code, Rest], St2}.
 
 %% Compiles E so that its value goes to continuation K.
-expr_k({'case', _, E, Clauses}, K, St0) ->
+expr_k({'case', Anno, E, Clauses}, K, St0) ->
     {Code, Ref, St1} = expr(E, St0),
     {Branches, St2} = clauses(Clauses, [Ref], K,
-                              ["alku_error_case_clause(", Ref, ");\n"], St1),
-    {[Code, Branches], St2};
-expr_k({'if', _, Clauses}, K, St) ->
-    clauses(Clauses, [], K, "alku_error_if_clause();\n", St);
+                              [at(Anno), "alku_error_case_clause(", Ref, ");\n"], St1),
+    {[at(Anno), Code, Branches], St2};
+expr_k({'if', Anno, Clauses}, K, St) ->
+    clauses(Clauses, [], K, [at(Anno), "alku_error_if_clause();\n"], St);
 expr_k({block, _, Body}, K, St) ->
     body(Body, K, St);
 expr_k({op, _, Op, A, B}, K, St0) when Op =:= 'andalso'; Op =:= 'orelse' ->
@@ -379,7 +410,7 @@ expr_k({op, _, Op, A, B}, K, St0) when Op =:= 'andalso'; Op =:= 'orelse' ->
 expr_k({call, Anno, Callee, Args}, tail, St0) ->
     {ArgCode, Refs, St1} = exprs(Args, St0),
     {CalleeCode, Target, St2} = callee(Callee, length(Args), Anno, St1),
-    {[ArgCode, CalleeCode, tail_call(Target, Refs, St2)], St2};
+    {[ArgCode, CalleeCode, at(Anno), tail_call(Target, Refs, St2)], St2};
 expr_k({'try', _, Body, OfClauses, CatchClauses, []}, K, St0) ->
     %% try Body of OfClauses catch CatchClauses end
     {H, St1} = fresh("handler", St0),
@@ -430,22 +461,25 @@ expr_k(E, K, St0) ->
     {[Code, continue(K, Ref, St1)], St1}.
 
 %% The catch part of a try, run after an exception has jumped back here.
-%% Each clause looks like Class:Reason:Stacktrace (the stacktrace is []).
+%% Each clause looks like Class:Reason:Stacktrace.
 catch_clauses(Clauses0, K, St0) ->
     {Class, St1} = fresh("class", St0),
     {Reason, St2} = fresh("reason", St1),
-    Clauses = [{clause, A, [C, R], G, [{match, A, S, {nil, A}} | B]}
+    {Stack, St3} = fresh("stack", St2),
+    Clauses = [{clause, A, [C, R, S], G, B}
                || {clause, A, [{tuple, _, [C, R, S]}], G, B} <- Clauses0],
     Reraise = ["alku_raise(", Class, ", ", Reason, ");\n"],
-    {Code, St3} = clauses(Clauses, [Class, Reason], K, Reraise, St2),
+    {Code, St4} = clauses(Clauses, [Class, Reason, Stack], K, Reraise, St3),
     {["{\n",
       "Value ", Class, " = alku_caught_class();\n",
       "Value ", Reason, " = alku_caught_reason();\n",
+      "Value ", Stack, " = alku_caught_stack();\n",
       Code,
-      "}\n"], St3}.
+      "}\n"], St4}.
 
 continue(tail, Ref, _St) ->
-    ["return ", Ref, ";\n"];
+    ["alku_frames = frame.prev;\n",
+     "return ", Ref, ";\n"];
 continue({assign, Var, Label, Exports}, Ref, St) ->
     %% copy exported variables bound on this path into their shared C variables
     [[[CVar, " = ", Bound, ";\n"] || {Name, CVar} <- Exports,
@@ -538,7 +572,7 @@ resolve(Module, Name, Arity, Anno, St) ->
 missing(Module, Name, Arity, St) ->
     UserModule = maps:is_key(Module, St#st.modules) andalso
         not alku_stdlib:is_stdlib_module(Module),
-    Known = lists:member(Module, [erlang, io, file, math, binary, unicode]) orelse
+    Known = lists:member(Module, [erlang, io, io_lib, file, math, binary, unicode, os, rand]) orelse
         maps:is_key(Module, St#st.modules),
     if
         UserModule ->
@@ -566,13 +600,22 @@ tail_call({apply, Ref}, Refs, #st{self_ref = Ref, arity = Arity})
   when length(Refs) =:= Arity ->
     self_tail_call(Refs);
 tail_call({alku, CName}, Refs, _St) ->
-    ["return alku_tail_call(", CName, ", NULL, ", integer_to_list(length(Refs)), ", ",
-     value_array(Refs), ");\n"];
+    leave_with(["alku_tail_call(", CName, ", NULL, ", integer_to_list(length(Refs)), ", ",
+                value_array(Refs), ")"]);
 tail_call({apply, Fun}, Refs, _St) ->
-    ["return alku_tail_apply(", Fun, ", ", integer_to_list(length(Refs)), ", ",
-     value_array(Refs), ");\n"];
+    leave_with(["alku_tail_apply(", Fun, ", ", integer_to_list(length(Refs)), ", ",
+                value_array(Refs), ")"]);
 tail_call({bif, _} = Target, Refs, _St) ->
-    ["return ", call(Target, Refs), ";\n"].
+    leave_with(call(Target, Refs)).
+
+%% Computes the result (errors still show this frame), leaves the frame,
+%% returns. A tail-called function then runs without this frame below it.
+leave_with(CExpr) ->
+    ["{\n",
+     "Value tail_result = ", CExpr, ";\n",
+     "alku_frames = frame.prev;\n",
+     "return tail_result;\n",
+     "}\n"].
 
 %% Calling ourselves in tail position: new arguments, then jump back to the
 %% start. The new values are computed before any argument is overwritten.
@@ -589,9 +632,19 @@ self_tail_call(Refs) ->
 
 expr(E, St) ->
     case literal(E) of
-        {ok, Literal} -> {[], Literal, St};
-        error -> compound(E, St)
+        {ok, Literal} ->
+            {[], Literal, St};
+        error ->
+            {Code, Ref, St1} = compound(E, St),
+            {[line_store(E), Code], Ref, St1}
     end.
+
+%% Expressions that can raise record their line first.
+line_store({Kind, Anno, _}) when Kind =:= 'if'; Kind =:= map; Kind =:= bin -> at(Anno);
+line_store({Kind, Anno, _, _}) when Kind =:= call; Kind =:= match; Kind =:= 'case';
+                                    Kind =:= op; Kind =:= map -> at(Anno);
+line_store({op, Anno, _, _, _}) -> at(Anno);
+line_store(_) -> [].
 
 compound({var, Anno, Name}, St) ->
     case St#st.vars of
@@ -983,6 +1036,29 @@ bif(binary, list_to_bin, 1) -> {ok, "alku_bif_list_to_binary"};
 bif(unicode, characters_to_binary, 1) -> {ok, "alku_unicode_characters_to_binary"};
 bif(unicode, characters_to_list, 1) -> {ok, "alku_unicode_characters_to_list"};
 bif(file, read_file, 1) -> {ok, "alku_file_read_file"};
+bif(erlang, float_to_binary, 1) -> {ok, "alku_bif_float_to_binary_1"};
+bif(erlang, float_to_binary, 2) -> {ok, "alku_bif_float_to_binary_2"};
+bif(erlang, binary_to_float, 1) -> {ok, "alku_bif_binary_to_float"};
+bif(erlang, make_tuple, 2) -> {ok, "alku_bif_make_tuple"};
+bif(erlang, size, 1) -> {ok, "alku_bif_size"};
+bif(erlang, list_to_existing_atom, 1) -> {ok, "alku_bif_list_to_atom"};
+bif(erlang, binary_to_existing_atom, 1) -> {ok, "alku_bif_binary_to_atom_1"};
+bif(erlang, binary_to_existing_atom, 2) -> {ok, "alku_bif_binary_to_atom_2"};
+bif(erlang, system_time, 0) -> {ok, "alku_bif_system_time_0"};
+bif(erlang, system_time, 1) -> {ok, "alku_bif_system_time_1"};
+bif(erlang, monotonic_time, 0) -> {ok, "alku_bif_monotonic_time_0"};
+bif(erlang, monotonic_time, 1) -> {ok, "alku_bif_monotonic_time_1"};
+bif(io, fwrite, 1) -> {ok, "alku_io_format_1"};
+bif(io, fwrite, 2) -> {ok, "alku_io_format_2"};
+bif(io, fwrite, 3) -> {ok, "alku_io_format_3"};
+bif(io_lib, format, 2) -> {ok, "alku_io_lib_format"};
+bif(io_lib, fwrite, 2) -> {ok, "alku_io_lib_format"};
+bif(os, getenv, 1) -> {ok, "alku_os_getenv_1"};
+bif(os, getenv, 2) -> {ok, "alku_os_getenv_2"};
+bif(os, timestamp, 0) -> {ok, "alku_os_timestamp"};
+bif(rand, uniform, 0) -> {ok, "alku_rand_uniform_0"};
+bif(rand, uniform, 1) -> {ok, "alku_rand_uniform_1"};
+bif(timer, sleep, 1) -> {ok, "alku_timer_sleep"};
 bif(erlang, is_integer, 1) -> {ok, "alku_bif_is_integer"};
 bif(erlang, is_atom, 1) -> {ok, "alku_bif_is_atom"};
 bif(erlang, is_boolean, 1) -> {ok, "alku_bif_is_boolean"};

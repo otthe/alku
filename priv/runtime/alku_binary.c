@@ -499,6 +499,20 @@ Value alku_unicode_characters_to_list(Value data) {
     return list;
 }
 
+Value alku_bif_float_to_binary_2(Value f, Value options) {
+    Buffer b = {0};
+    print_chars(&b, alku_bif_float_to_list_2(f, options), f);
+    return buffer_to_binary(&b);
+}
+
+Value alku_bif_float_to_binary_1(Value f) {
+    return alku_bif_float_to_binary_2(f, alku_nil());
+}
+
+Value alku_bif_binary_to_float(Value bin) {
+    return alku_bif_list_to_float(alku_bif_binary_to_list(bin));
+}
+
 /* ---------- The binary module ---------- */
 
 static bool starts_with(const AlkuBinary *b, size_t at, const AlkuBinary *pattern) {

@@ -112,12 +112,39 @@ struct AlkuFun {
  * arguments) and returns the process exit status. */
 int alku_start(AlkuCode main, int arity, int argc, char **argv);
 
+/* Call frames, for stack traces. Every compiled function keeps an
+ * AlkuFrame on the C stack while it runs; frame.line is the line it is
+ * executing. A tail call leaves the frame first, as in Erlang, so loops
+ * do not pile up frames. */
+typedef struct {
+    const char *module;
+    const char *function;
+    int arity;
+    const char *file;
+} AlkuFunctionInfo;
+
+typedef struct AlkuFrame {
+    struct AlkuFrame *prev;
+    const AlkuFunctionInfo *info;
+    int line;
+} AlkuFrame;
+
+extern AlkuFrame *alku_frames; /* the innermost frame */
+
+static inline void alku_enter(AlkuFrame *frame, const AlkuFunctionInfo *info, int line) {
+    frame->prev = alku_frames;
+    frame->info = info;
+    frame->line = line;
+    alku_frames = frame;
+}
+
 /* Exceptions. try pushes a handler, then calls setjmp(handler.env):
- * raising an exception jumps there with the class (error, throw or exit)
- * and reason available from alku_caught_class/alku_caught_reason. */
+ * raising an exception jumps there with the class (error, throw or exit),
+ * reason and stack trace available from alku_caught_class/reason/stack. */
 typedef struct AlkuHandler {
     jmp_buf env;
     struct AlkuHandler *prev;
+    AlkuFrame *frames; /* the frames when the try started */
 } AlkuHandler;
 
 void alku_try(AlkuHandler *h);
@@ -125,6 +152,7 @@ void alku_end_try(AlkuHandler *h);
 _Noreturn void alku_raise(Value class, Value reason);
 Value alku_caught_class(void);
 Value alku_caught_reason(void);
+Value alku_caught_stack(void);
 Value alku_catch_value(Value class, Value reason);
 
 /* Calls and tail calls */
@@ -303,6 +331,22 @@ Value alku_binary_at(Value bin, Value pos);
 Value alku_binary_first(Value bin);
 Value alku_binary_last(Value bin);
 Value alku_file_read_file(Value name);
+Value alku_bif_float_to_binary_1(Value f);
+Value alku_bif_float_to_binary_2(Value f, Value options);
+Value alku_bif_binary_to_float(Value bin);
+Value alku_bif_make_tuple(Value n, Value init);
+Value alku_bif_size(Value v);
+Value alku_bif_system_time_0(void);
+Value alku_bif_system_time_1(Value unit);
+Value alku_bif_monotonic_time_0(void);
+Value alku_bif_monotonic_time_1(Value unit);
+Value alku_io_lib_format(Value format, Value args);
+Value alku_os_getenv_1(Value name);
+Value alku_os_getenv_2(Value name, Value fallback);
+Value alku_os_timestamp(void);
+Value alku_rand_uniform_0(void);
+Value alku_rand_uniform_1(Value n);
+Value alku_timer_sleep(Value ms);
 Value alku_math_pi(void);
 Value alku_math_sqrt(Value x);
 Value alku_math_pow(Value x, Value y);

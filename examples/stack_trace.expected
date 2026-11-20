@@ -1,0 +1,7 @@
+caught badarith
+  stack_trace:inner/1 line 4
+  stack_trace:middle/1 line 5
+  stack_trace:main/0 line 10
+** exception error: an error occurred when evaluating an arithmetic expression
+     in function  stack_trace:inner/1 (examples/stack_trace.erl, line 4)
+     in call from stack_trace:middle/1 (examples/stack_trace.erl, line 5)

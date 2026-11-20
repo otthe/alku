@@ -4,7 +4,7 @@
 
 -export([modules/0, is_stdlib_module/1]).
 
--define(MODULES, [lists, maps, string]).
+-define(MODULES, [lists, maps, proplists, string, timer]).
 
 %% Parsed and checked forms of every standard library module.
 -spec modules() -> [{module(), [erl_parse:abstract_form()]}].

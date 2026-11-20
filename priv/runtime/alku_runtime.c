@@ -1,9 +1,14 @@
+/* POSIX: clock_gettime, nanosleep, getpid, pause */
+#define _POSIX_C_SOURCE 200809L
+
 #include "alku_internal.h"
 #include "alku_gc.h"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -216,7 +221,28 @@ static char *c_string(Value chars);
  * exception jumps to the innermost one. The caught class and reason are
  * kept in globals, which stay valid across longjmp. */
 static AlkuHandler *handlers;
-static Value caught_class, caught_reason;
+static Value caught_class, caught_reason, caught_stack;
+
+AlkuFrame *alku_frames;
+
+/* Erlang's stack trace format, innermost call first, at most 8 calls:
+ * [{Module, Function, Arity, [{file, File}, {line, Line}]}, ...] */
+static Value stack_trace(void) {
+    AlkuFrame *frames[8];
+    size_t n = 0;
+    for (AlkuFrame *f = alku_frames; f != NULL && n < 8; f = f->prev) frames[n++] = f;
+    Value list = alku_nil();
+    while (n > 0) {
+        AlkuFrame *f = frames[--n];
+        Value location = alku_cons(pair("file", alku_string(f->info->file, strlen(f->info->file))),
+                                   alku_cons(pair("line", alku_int(f->line)), alku_nil()));
+        Value entry = alku_make_tuple(4, (Value[]){alku_atom(f->info->module),
+                                                   alku_atom(f->info->function),
+                                                   alku_int(f->info->arity), location});
+        list = alku_cons(entry, list);
+    }
+    return list;
+}
 
 /* Extra details for the message printed when an error is not caught. */
 static struct {
@@ -228,6 +254,7 @@ static struct {
 
 void alku_try(AlkuHandler *h) {
     h->prev = handlers;
+    h->frames = alku_frames;
     handlers = h;
 }
 
@@ -237,15 +264,18 @@ void alku_end_try(AlkuHandler *h) {
 
 Value alku_caught_class(void) { return caught_class; }
 Value alku_caught_reason(void) { return caught_reason; }
+Value alku_caught_stack(void) { return caught_stack; }
 
 static _Noreturn void uncaught(Value class, Value reason);
 
 static _Noreturn void raise_keeping_info(Value class, Value reason) {
+    caught_class = class;
+    caught_reason = reason;
+    caught_stack = stack_trace();
     AlkuHandler *h = handlers;
     if (h == NULL) uncaught(class, reason);
     handlers = h->prev;
-    caught_class = class;
-    caught_reason = reason;
+    alku_frames = h->frames; /* back to the frames of the function with the try */
     longjmp(h->env, 1);
 }
 
@@ -267,7 +297,7 @@ Value pair(const char *tag, Value v) {
 Value alku_catch_value(Value class, Value reason) {
     if (is_atom_named(class, "throw")) return reason;
     if (is_atom_named(class, "exit")) return pair("EXIT", reason);
-    return pair("EXIT", alku_make_tuple(2, (Value[]){reason, alku_nil()}));
+    return pair("EXIT", alku_make_tuple(2, (Value[]){reason, caught_stack}));
 }
 
 _Noreturn void badarith(void) {
@@ -380,6 +410,30 @@ static void describe_error(Buffer *b, Value reason) {
     }
 }
 
+/* Where it happened, as Erlang's shell shows it:
+ *      in function  shapes:area/1 (shapes.erl, line 4)
+ *      in call from main:main/0 (main.erl, line 9) */
+static void describe_stack(Buffer *b) {
+    bool first = true;
+    for (Value s = caught_stack; s.tag == ALKU_CONS; s = s.as.cons->tail) {
+        const Value *entry = s.as.cons->head.as.tuple->elements;
+        const Value *location = entry[3].as.cons->head.as.tuple->elements;
+        const Value *line = entry[3].as.cons->tail.as.cons->head.as.tuple->elements;
+        buf_puts(b, first ? "\n     in function  " : "\n     in call from ");
+        first = false;
+        print_atom(b, entry[0].as.atom);
+        buf_putc(b, ':');
+        print_atom(b, entry[1].as.atom);
+        buf_putc(b, '/');
+        buf_int(b, entry[2].as.integer);
+        buf_puts(b, " (");
+        print_chars(b, location[1], location[1]);
+        buf_puts(b, ", line ");
+        buf_int(b, line[1].as.integer);
+        buf_putc(b, ')');
+    }
+}
+
 static _Noreturn void uncaught(Value class, Value reason) {
     Buffer b = {0};
     buf_puts(&b, "** exception ");
@@ -390,6 +444,7 @@ static _Noreturn void uncaught(Value class, Value reason) {
     } else {
         print_value(&b, reason, true);
     }
+    describe_stack(&b);
     buf_putc(&b, '\n');
     fflush(stdout); /* keep the program's earlier output before the error */
     buf_flush(&b, stderr);
@@ -1117,6 +1172,15 @@ Value alku_io_format_1(Value fmt) {
     return alku_io_format_3(alku_atom("standard_io"), fmt, alku_nil());
 }
 
+/* io_lib:format: the formatted text as a string instead of printing it. */
+Value alku_io_lib_format(Value fmt, Value args) {
+    Buffer b = {0};
+    format(&b, fmt, args);
+    Value result = utf8_to_list((const unsigned char *)b.data, b.length);
+    free(b.data);
+    return result;
+}
+
 Value alku_io_write_2(Value dev, Value v) {
     Buffer b = {0};
     print_value(&b, v, false);
@@ -1252,6 +1316,118 @@ Value alku_file_read_file(Value name) {
     return pair("ok", bin);
 }
 
+/* ---------- Tuples, time, environment, random numbers ---------- */
+
+Value alku_bif_make_tuple(Value n, Value init) {
+    if (n.tag != ALKU_INT || n.as.integer < 0 || n.as.integer > (1 << 24)) badarg(n);
+    Value t = alku_make_tuple((size_t)n.as.integer, NULL);
+    for (int64_t i = 0; i < n.as.integer; i++) t.as.tuple->elements[i] = init;
+    return t;
+}
+
+/* size/1: of a tuple or a binary */
+Value alku_bif_size(Value v) {
+    if (v.tag == ALKU_TUPLE) return alku_int((int64_t)v.as.tuple->arity);
+    return alku_bif_byte_size(v);
+}
+
+static int64_t nanoseconds(clockid_t clock) {
+    struct timespec ts;
+    clock_gettime(clock, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* Erlang time units; native is nanoseconds here. */
+static Value in_unit(int64_t ns, Value unit) {
+    if (is_atom_named(unit, "second") || is_atom_named(unit, "seconds")) return alku_int(ns / 1000000000);
+    if (is_atom_named(unit, "millisecond")) return alku_int(ns / 1000000);
+    if (is_atom_named(unit, "microsecond")) return alku_int(ns / 1000);
+    if (is_atom_named(unit, "nanosecond") || is_atom_named(unit, "native")) return alku_int(ns);
+    badarg(unit);
+}
+
+Value alku_bif_system_time_1(Value unit) { return in_unit(nanoseconds(CLOCK_REALTIME), unit); }
+Value alku_bif_system_time_0(void) { return alku_int(nanoseconds(CLOCK_REALTIME)); }
+Value alku_bif_monotonic_time_1(Value unit) { return in_unit(nanoseconds(CLOCK_MONOTONIC), unit); }
+Value alku_bif_monotonic_time_0(void) { return alku_int(nanoseconds(CLOCK_MONOTONIC)); }
+
+/* os:timestamp(): {MegaSecs, Secs, MicroSecs} */
+Value alku_os_timestamp(void) {
+    int64_t us = nanoseconds(CLOCK_REALTIME) / 1000;
+    return alku_make_tuple(3, (Value[]){alku_int(us / 1000000000000), alku_int(us / 1000000 % 1000000),
+                                        alku_int(us % 1000000)});
+}
+
+Value alku_os_getenv_2(Value name, Value fallback) {
+    char *key = c_string(name);
+    const char *value = getenv(key);
+    free(key);
+    return value ? alku_string(value, strlen(value)) : fallback;
+}
+
+Value alku_os_getenv_1(Value name) {
+    return alku_os_getenv_2(name, alku_atom("false"));
+}
+
+Value alku_timer_sleep(Value ms) {
+    if (is_atom_named(ms, "infinity")) {
+        for (;;) pause();
+    }
+    if (ms.tag != ALKU_INT || ms.as.integer < 0) badarg(ms);
+    struct timespec ts = {(time_t)(ms.as.integer / 1000), (long)(ms.as.integer % 1000) * 1000000};
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+    return alku_atom("ok");
+}
+
+/* rand: xoshiro256** seeded from the clock and the process id. */
+static uint64_t rand_state[4];
+static bool rand_seeded;
+
+static uint64_t rotl(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+static uint64_t splitmix(uint64_t *x) {
+    uint64_t z = (*x += 0x9E3779B97F4A7C15u);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9u;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBu;
+    return z ^ (z >> 31);
+}
+
+static uint64_t next_random(void) {
+    if (!rand_seeded) {
+        uint64_t seed = (uint64_t)nanoseconds(CLOCK_REALTIME) ^ ((uint64_t)getpid() << 32);
+        for (int i = 0; i < 4; i++) rand_state[i] = splitmix(&seed);
+        rand_seeded = true;
+    }
+    uint64_t *s = rand_state;
+    uint64_t result = rotl(s[1] * 5, 7) * 9;
+    uint64_t t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = rotl(s[3], 45);
+    return result;
+}
+
+/* A float in [0.0, 1.0) */
+Value alku_rand_uniform_0(void) {
+    return alku_float((double)(next_random() >> 11) * 0x1.0p-53);
+}
+
+/* An integer in 1..N */
+Value alku_rand_uniform_1(Value n) {
+    if (n.tag != ALKU_INT || n.as.integer < 1) badarg(n);
+    uint64_t range = (uint64_t)n.as.integer;
+    uint64_t limit = UINT64_MAX - UINT64_MAX % range; /* no modulo bias */
+    uint64_t r;
+    do r = next_random(); while (r >= limit);
+    return alku_int((int64_t)(r % range) + 1);
+}
+
 /* ---------- halt ---------- */
 
 Value alku_bif_halt_1(Value status) {
@@ -1327,6 +1503,7 @@ static void *run_main(void *unused) {
     gc_add_root(&pending, sizeof pending);
     gc_add_root(&caught_class, sizeof caught_class);
     gc_add_root(&caught_reason, sizeof caught_reason);
+    gc_add_root(&caught_stack, sizeof caught_stack);
     gc_add_root(&error_info, sizeof error_info);
     if (program.arity == 1) { /* main(Args): the command-line arguments as strings */
         ListBuilder lb = list_builder();

@@ -97,7 +97,8 @@ you can put it on your PATH, e.g.
 - `math`: `pi sqrt pow exp log log2 log10 sin cos tan asin acos atan atan2
   floor ceil`
 - `maps`: `new get put update remove is_key find keys values to_list
-  from_list size merge fold map filter foreach update_with with without`
+  from_list from_keys size merge fold map filter foreach take update_with
+  with without`
 - Binaries: `is_binary/1`, `byte_size/1`, `bit_size/1`,
   `binary_to_list/1`, `list_to_binary/1`, `iolist_to_binary/1`,
   `iolist_size/1`, `binary_part/3`, `split_binary/2`, `atom_to_binary/1,2`,
@@ -110,13 +111,29 @@ you can put it on your PATH, e.g.
   `io:nl/0,1`, `io:get_line/1,2`, `file:open/2` (read, write, append),
   `file:close/1`, `file:read_file/1`, `file:write_file/2` (which writes
   bytes, as in Erlang: use `unicode:characters_to_binary/1` for text)
-- Standard library `lists`: `all any append duplicate filter flatten foldl
-  foldr foreach last map max member min nth reverse seq sort sum zip`
-- Standard library `string`: `is_empty join lowercase split tokens
-  to_lower to_upper trim uppercase`
+- Standard library `lists`: `all any append concat delete droplast
+  dropwhile duplicate enumerate filter filtermap flatmap flatten foldl foldr
+  foreach join keydelete keyfind keymember keyreplace keysort keystore
+  keytake last map mapfoldl max member min nth nthtail partition prefix
+  reverse search seq sort split splitwith sublist subtract suffix sum
+  takewhile uniq unzip usort zip zipwith`
+- `string` (works on lists and binaries, returns the same kind): `chomp
+  equal find is_empty join length lexemes lowercase pad prefix replace
+  reverse slice split to_integer to_lower to_upper tokens trim uppercase`
+- `proplists`: `delete from_map get_all_values get_bool get_keys get_value
+  is_defined lookup lookup_all to_map`
+- `io_lib:format/2`, `timer:sleep/1 tc/1,2`, `rand:uniform/0,1`,
+  `os:getenv/1,2 timestamp/0`, `erlang:system_time/0,1 monotonic_time/0,1`,
+  `float_to_binary/1,2`, `binary_to_float/1`, `make_tuple/2`, `size/1`
 - `io:format` controls: `~w ~p ~s ~c ~b ~B ~f ~e ~i ~n ~~` with field
   width, precision and padding (`~5B`, `~-10s`, `~.2f`, `~2..0B`, `~.16B`)
-- Erlang-style runtime errors (`no function clause matching f(5)`, ...)
+- Erlang-style runtime errors with stack traces:
+  ```
+  ** exception error: no function clause matching only_small(5)
+       in function  function_clause:only_small/1 (examples/function_clause.erl, line 4)
+       in call from function_clause:main/0 (examples/function_clause.erl, line 8)
+  ```
+  `catch Class:Reason:Stack` gets the same trace in Erlang's format.
 - Compile errors and warnings from Erlang's own linter
 
 Programs that use only these features are also valid Erlang and print
@@ -124,8 +141,8 @@ the same output under `erl`. Differences: `~p` never breaks long terms
 over several lines, and maps with more than 32 keys print in key order
 (Erlang uses hash order for those).
 
-Not yet: bitstrings, utf16/utf32 segments, stack traces, `"abc" ++ Rest`
-patterns, `~g`, string functions on binaries.
+Not yet: bitstrings, utf16/utf32 segments, `"abc" ++ Rest` patterns, `~g`,
+`apply/3` and calls to modules chosen at run time.
 
 ## How the runtime works
 
@@ -147,6 +164,10 @@ patterns, `~g`, string functions on binaries.
   (a trampoline), so the C stack never grows.
 - **Exceptions** use `setjmp`/`longjmp`: `try` pushes a handler on the C
   stack and raising jumps to the innermost one.
+- **Stack traces**: every function keeps a small frame (function, file,
+  current line) on the C stack. A tail call leaves the frame first, so, as
+  in Erlang, tail-called functions don't appear in traces and loops don't
+  pile up frames.
 - **Garbage collector** (`alku_gc.c`): mark-and-sweep. Roots are found by
   scanning the C stack conservatively; heap objects are traced precisely.
   Set `ALKU_GC_STRESS=1` to collect very often, which the tests do to

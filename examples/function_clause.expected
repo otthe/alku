@@ -1,2 +1,4 @@
 1
 ** exception error: no function clause matching only_small(5)
+     in function  function_clause:only_small/1 (examples/function_clause.erl, line 4)
+     in call from function_clause:main/0 (examples/function_clause.erl, line 8)

@@ -11,7 +11,7 @@
 -export([to_c/1, build/2]).
 
 %% Modules provided by the C runtime; programs cannot define these.
--define(BUILTIN_MODULES, [erlang, io, file, math, binary, unicode]).
+-define(BUILTIN_MODULES, [erlang, io, io_lib, file, math, binary, unicode, os, rand]).
 
 %% Translates a program to C. Returns the C code and any warnings.
 -spec to_c(file:filename()) -> {ok, iodata(), [string()]} | {error, [string()]}.
