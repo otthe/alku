@@ -4,6 +4,7 @@
  *   alku_runtime.c  values, printing, exceptions, lists, tuples, io, calls
  *   alku_number.c   integers (with bignums), floats, math
  *   alku_map.c      maps
+ *   alku_binary.c   binaries and the bit syntax
  *   alku_gc.c       memory
  */
 #ifndef ALKU_INTERNAL_H
@@ -23,6 +24,13 @@ void buf_putc(Buffer *b, char c);
 void buf_puts(Buffer *b, const char *s);
 void buf_int(Buffer *b, int64_t n);
 void buf_flush(Buffer *b, FILE *out);
+void buf_utf8(Buffer *b, int64_t c);
+bool is_char_code(int64_t c);
+
+/* Characters (code points, nested lists, binaries as UTF-8) as UTF-8. */
+void print_chars(Buffer *b, Value v, Value arg);
+/* iodata: bytes 0..255, binaries and nested lists of them, as raw bytes. */
+void print_iodata(Buffer *b, Value v, Value arg);
 
 /* ~w (pretty = false) and ~p (pretty = true) */
 void print_value(Buffer *b, Value v, bool pretty);
@@ -50,6 +58,15 @@ void print_integer(Buffer *b, Value v, unsigned base, bool lowercase);
 void print_float_fixed(Buffer *b, double d, int decimals);      /* ~f */
 void print_float_scientific(Buffer *b, double d, int digits);   /* ~e */
 Value parse_integer(const char *text, size_t length, unsigned base, bool *ok);
+
+void integer_to_be_bytes(Value v, unsigned char *out, size_t n); /* two's complement */
+Value integer_from_be_bytes(const unsigned char *in, size_t n, bool is_signed);
+
+/* alku_binary.c */
+Value make_binary(const void *bytes, size_t n);
+void print_binary(Buffer *b, Value v, bool pretty);
+int compare_binaries(Value a, Value b);
+void append_binary(Buffer *b, Value v);
 
 /* alku_map.c */
 int compare_maps(Value a, Value b, bool exact);

@@ -9,7 +9,8 @@
 -export([compile/2]).
 
 -define(RUNTIME_HEADERS, ["alku_runtime.h", "alku_internal.h", "alku_gc.h"]).
--define(RUNTIME_SOURCES, ["alku_runtime.c", "alku_number.c", "alku_map.c", "alku_gc.c"]).
+-define(RUNTIME_SOURCES, ["alku_runtime.c", "alku_number.c", "alku_map.c",
+                          "alku_binary.c", "alku_gc.c"]).
 
 -spec compile(file:filename(), file:filename()) -> ok | {error, string()}.
 compile(CFile, Exe) ->

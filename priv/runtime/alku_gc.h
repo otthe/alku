@@ -20,7 +20,8 @@ typedef enum {
     GC_TUPLE,
     GC_FUN,
     GC_BIG,  /* big integer digits: nothing to trace */
-    GC_MAP   /* map tree node */
+    GC_MAP,  /* map tree node */
+    GC_BINARY
 } GcKind;
 
 /* stack_bottom: an address in the outermost frame that runs Alku code. */

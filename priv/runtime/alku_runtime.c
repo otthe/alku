@@ -37,11 +37,11 @@ void buf_int(Buffer *b, int64_t n) {
     buf_puts(b, digits);
 }
 
-static bool is_char_code(int64_t c) {
+bool is_char_code(int64_t c) {
     return c >= 0 && c <= 0x10FFFF;
 }
 
-static void buf_utf8(Buffer *b, int64_t c) {
+void buf_utf8(Buffer *b, int64_t c) {
     if (c < 0x80) {
         buf_putc(b, (char)c);
     } else if (c < 0x800) {
@@ -155,6 +155,9 @@ void print_value(Buffer *b, Value v, bool pretty) {
         break;
     case ALKU_MAP:
         print_map(b, v, pretty);
+        break;
+    case ALKU_BINARY:
+        print_binary(b, v, pretty);
         break;
     case ALKU_FUN:
         /* "fun lists:map/2" for external funs, #Fun<...> for the rest */
@@ -539,9 +542,10 @@ static int term_class(AlkuTag tag) {
     case ALKU_MAP: return 5;
     case ALKU_NIL: return 6;
     case ALKU_CONS: return 7;
-    case ALKU_PENDING: return 8;
+    case ALKU_BINARY: return 8;
+    case ALKU_PENDING: return 9;
     }
-    return 8;
+    return 9;
 }
 
 int compare_terms(Value a, Value b, bool exact) {
@@ -589,6 +593,8 @@ int compare_terms(Value a, Value b, bool exact) {
         }
         case ALKU_MAP:
             return compare_maps(a, b, exact);
+        case ALKU_BINARY:
+            return compare_binaries(a, b);
         case ALKU_CONS: {
             int c = compare_terms(a.as.cons->head, b.as.cons->head, exact);
             if (c != 0) return c;
@@ -882,23 +888,49 @@ static Value error_tuple(int e) {
 
 /* ---------- io ---------- */
 
-/* ~s accepts an atom or a (possibly nested) list of character codes. */
-static void print_chars(Buffer *b, Value v, Value arg) {
+/* Text for ~s and io:put_chars: an atom, or a (possibly nested) list of
+ * character codes and binaries (whose bytes are taken as UTF-8). */
+void print_chars(Buffer *b, Value v, Value arg) {
     if (v.tag == ALKU_ATOM) {
         buf_puts(b, v.as.atom);
+        return;
+    }
+    if (v.tag == ALKU_BINARY) {
+        append_binary(b, v);
         return;
     }
     for (; v.tag == ALKU_CONS; v = v.as.cons->tail) {
         Value c = v.as.cons->head;
         if (c.tag == ALKU_INT && is_char_code(c.as.integer)) {
             buf_utf8(b, c.as.integer);
-        } else if (c.tag == ALKU_CONS || c.tag == ALKU_NIL) {
+        } else if (c.tag == ALKU_CONS || c.tag == ALKU_NIL || c.tag == ALKU_BINARY) {
             print_chars(b, c, arg);
         } else {
             badarg(arg);
         }
     }
-    if (v.tag != ALKU_NIL) badarg(arg);
+    if (v.tag != ALKU_NIL && v.tag != ALKU_BINARY) badarg(arg);
+    if (v.tag == ALKU_BINARY) append_binary(b, v); /* [... | <<"tail">>] */
+}
+
+/* iodata (for files and list_to_binary): bytes, binaries, nested lists. */
+void print_iodata(Buffer *b, Value v, Value arg) {
+    if (v.tag == ALKU_BINARY) {
+        append_binary(b, v);
+        return;
+    }
+    for (; v.tag == ALKU_CONS; v = v.as.cons->tail) {
+        Value c = v.as.cons->head;
+        if (c.tag == ALKU_INT && c.as.integer >= 0 && c.as.integer <= 255) {
+            buf_putc(b, (char)c.as.integer);
+        } else if (c.tag == ALKU_CONS || c.tag == ALKU_NIL || c.tag == ALKU_BINARY) {
+            print_iodata(b, c, arg);
+        } else {
+            badarg(arg);
+        }
+    }
+    if (v.tag == ALKU_BINARY) append_binary(b, v);
+    else if (v.tag != ALKU_NIL) badarg(arg);
 }
 
 /* A NUL-terminated UTF-8 copy of a string (for file names). Free it. */
@@ -1180,7 +1212,7 @@ Value alku_file_close(Value dev) {
 
 Value alku_file_write_file(Value name, Value data) {
     Buffer b = {0};
-    print_chars(&b, data, data);
+    print_iodata(&b, data, data);
     char *path = c_string(name);
     FILE *f = fopen(path, "w");
     int e = errno;
@@ -1193,6 +1225,31 @@ Value alku_file_write_file(Value name, Value data) {
     free(b.data);
     bool failed = fclose(f) != 0;
     return failed ? error_tuple(errno) : alku_atom("ok");
+}
+
+/* file:read_file: the whole file as a binary. */
+Value alku_file_read_file(Value name) {
+    char *path = c_string(name);
+    FILE *f = fopen(path, "rb");
+    int e = errno;
+    free(path);
+    if (f == NULL) return error_tuple(e);
+    Buffer b = {0};
+    char chunk[65536];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        for (size_t i = 0; i < n; i++) buf_putc(&b, chunk[i]);
+    }
+    bool failed = ferror(f);
+    e = errno;
+    fclose(f);
+    if (failed) {
+        free(b.data);
+        return error_tuple(e);
+    }
+    Value bin = make_binary(b.data, b.length);
+    free(b.data);
+    return pair("ok", bin);
 }
 
 /* ---------- halt ---------- */

@@ -28,6 +28,9 @@
     n = 0 :: non_neg_integer(),                     % counter for fresh C names
     vars = #{} :: #{atom() => string()},            % Erlang variable => C variable
     funs :: #{{module(), atom(), arity()} => true}, % every function in the program
+    exports :: #{{module(), atom(), arity()} => true}, % ... and the exported ones
+    imports = #{} :: #{{atom(), arity()} => module()}, % -import of this module
+    modules :: #{module() => true},                 % modules of the program
     module :: module(),
     cname :: string(),                % the C function being compiled
     arity :: arity(),                 % ... and its arity
@@ -50,7 +53,12 @@ program([{Main, _} | _] = Modules) ->
                         _ -> throw({alku_error, Main, 1,
                                     "a program needs a main/0 or main/1 function"})
                     end,
-        Compiled = lists:append([compile_function(M, F, Funs)
+        Exports = maps:from_list([{{M, F, A}, true}
+                                  || {M, Forms} <- Modules,
+                                     {attribute, _, export, Es} <- Forms, {F, A} <- Es]),
+        Program = #st{funs = Funs, exports = Exports,
+                      modules = maps:from_list([{M, true} || {M, _} <- Modules])},
+        Compiled = lists:append([compile_function(M, F, imports(Forms), Program)
                                  || {M, Forms} <- Modules,
                                     {function, _, _, _, _} = F <- Forms]),
         {Prototypes, Definitions} = lists:unzip(Compiled),
@@ -70,18 +78,20 @@ program([{Main, _} | _] = Modules) ->
 
 %% ---------- Functions ----------
 
-compile_function(Module, Function, Funs) ->
+imports(Forms) ->
+    maps:from_list([{{F, A}, From} || {attribute, _, import, {From, Fs}} <- Forms, {F, A} <- Fs]).
+
+compile_function(Module, Function, Imports, Program) ->
     try
-        function(Module, Function, Funs)
+        function(Module, Function, Program#st{module = Module, imports = Imports})
     catch
         throw:{alku_error, Line, Message} -> throw({alku_error, Module, Line, Message})
     end.
 
 %% Returns {Prototype, Definition} for the function and the funs inside it.
-function(Module, {function, _, Name, Arity, Clauses}, Funs) ->
-    St0 = #st{funs = Funs, module = Module,
-              cname = alku_c:function_name(Module, Name, Arity), arity = Arity,
-              display = atom_to_list(Name) ++ "/" ++ integer_to_list(Arity)},
+function(Module, {function, _, Name, Arity, Clauses}, Program) ->
+    St0 = Program#st{cname = alku_c:function_name(Module, Name, Arity), arity = Arity,
+                     display = atom_to_list(Name) ++ "/" ++ integer_to_list(Arity)},
     {Prototype, Definition, St} = c_function(atom_to_list(Name), [], Clauses, St0),
     [{Prototype, Definition} | St#st.lifted].
 
@@ -159,6 +169,13 @@ pattern({cons, _, Head, Tail}, Subject, Fail, St0) ->
     {[check(["alku_is_cons(", Subject, ")"], Fail), Code], St1};
 pattern({string, Anno, Chars}, Subject, Fail, St) ->
     pattern(string_to_list_pattern(Chars, Anno), Subject, Fail, St);
+pattern({bin, _, Elements}, Subject, Fail, St0) ->
+    {M, St1} = fresh("match", St0),
+    {Code, St2} = bin_pattern(Elements, M, Fail, St1),
+    {["AlkuBinMatch ", M, ";\n",
+      check(["alku_bin_match_start(&", M, ", ", Subject, ")"], Fail),
+      Code,
+      check(["alku_bin_match_end(&", M, ")"], Fail)], St2};
 pattern({map, _, Fields}, Subject, Fail, St0) ->
     {Code, St1} = map_pattern(Fields, Subject, Fail, St0),
     {[check(["alku_is_map(", Subject, ")"], Fail), Code], St1};
@@ -186,6 +203,59 @@ map_pattern([{map_field_exact, _, Key, ValuePattern} | Rest], Subject, Fail, St0
       "Value ", Found, ";\n",
       check(["alku_map_lookup(", Subject, ", ", KeyRef, ", &", Found, ")"], Fail),
       ValueCode, RestCode], St4}.
+
+%% <<Segment, ...>> in a pattern: each segment is read from the match
+%% state M in order, so sizes can use variables bound by earlier segments.
+bin_pattern([], _M, _Fail, St) ->
+    {[], St};
+bin_pattern([{bin_element, A, {string, _, Chars}, Size, Type} | Rest], M, Fail, St) ->
+    bin_pattern([{bin_element, A, {char, A, C}, Size, Type} || C <- Chars] ++ Rest, M, Fail, St);
+bin_pattern([{bin_element, A, Pattern, Size, Specs} | Rest], M, Fail, St0) ->
+    {Type, Unit, Flags} = segment_type(Specs, A),
+    {SizeCode, SizeRef, St1} = segment_size(Size, Type, St0),
+    {V, St2} = fresh("segment", St1),
+    Get = case {Type, Size} of
+              {binary, default} -> ["alku_bin_get_rest(&", M, ", &", V, ")"];
+              {binary, _} -> ["alku_bin_get_binary(&", M, ", ", SizeRef, ", ", Unit, ", &", V, ")"];
+              {integer, _} -> ["alku_bin_get_integer(&", M, ", ", SizeRef, ", ", Unit, ", ",
+                               Flags, ", &", V, ")"];
+              {float, _} -> ["alku_bin_get_float(&", M, ", ", SizeRef, ", ", Unit, ", ",
+                             Flags, ", &", V, ")"];
+              {utf8, _} -> ["alku_bin_get_utf8(&", M, ", &", V, ")"]
+          end,
+    {Match, St3} = pattern(Pattern, V, Fail, St2),
+    {RestCode, St4} = bin_pattern(Rest, M, Fail, St3),
+    {[SizeCode, "Value ", V, ";\n", check(Get, Fail), Match, RestCode], St4}.
+
+%% {Type, Unit, Flags} of a segment from its type specifiers, as C text.
+segment_type(Specs0, Anno) ->
+    Specs = case Specs0 of default -> []; _ -> Specs0 end,
+    Type = lists:foldl(fun(integer, _) -> integer;
+                          (float, _) -> float;
+                          (S, _) when S =:= binary; S =:= bytes; S =:= bitstring; S =:= bits ->
+                               binary;
+                          (utf8, _) -> utf8;
+                          (S, _) when S =:= utf16; S =:= utf32 ->
+                               fail(Anno, io_lib:format("~s segments are not supported yet", [S]));
+                          (_, T) -> T
+                       end, integer, Specs),
+    Unit = case [U || {unit, U} <- Specs] of
+               [U | _] -> U;
+               [] when Type =:= binary -> 8;
+               [] -> 1
+           end,
+    Signed = case lists:member(signed, Specs) of true -> 1; false -> 0 end,
+    %% native byte order is little-endian on the x86 and ARM machines Alku runs on
+    Little = case lists:member(little, Specs) orelse lists:member(native, Specs) of
+                 true -> 2;
+                 false -> 0
+             end,
+    {Type, integer_to_list(Unit), integer_to_list(Signed bor Little)}.
+
+segment_size(default, integer, St) -> {[], "alku_int(8)", St};
+segment_size(default, float, St) -> {[], "alku_int(64)", St};
+segment_size(default, _, St) -> {[], "alku_atom(\"all\")", St};
+segment_size(Size, _, St) -> expr(Size, St).
 
 %% "abc" in a pattern means [$a, $b, $c].
 string_to_list_pattern([], Anno) ->
@@ -253,7 +323,7 @@ boolean_safe(_) ->
 
 type_test(F) ->
     lists:member(F, [is_integer, is_float, is_number, is_atom, is_boolean, is_list,
-                     is_tuple, is_map, is_function]).
+                     is_tuple, is_map, is_function, is_binary, is_bitstring]).
 
 %% Expressions whose evaluation cannot raise.
 total({var, _, _}) -> true;
@@ -422,6 +492,7 @@ vars_outside_funs({'fun', _, _}) -> [];
 vars_outside_funs({named_fun, _, _, _}) -> [];
 vars_outside_funs({lc, _, _, _}) -> [];
 vars_outside_funs({mc, _, _, _}) -> [];
+vars_outside_funs({bc, _, _, _}) -> [];
 vars_outside_funs(T) when element(1, T) =:= var -> vars_in(T);
 vars_outside_funs(T) when is_tuple(T) -> vars_outside_funs(tuple_to_list(T));
 vars_outside_funs(L) when is_list(L) -> lists:flatmap(fun vars_outside_funs/1, L);
@@ -432,18 +503,51 @@ vars_outside_funs(_) -> [].
 %% What a call goes to: {alku, CName} (a function in the program),
 %% {bif, CFun} (a runtime function) or {apply, FunRef} (a fun value).
 callee({atom, _, Name}, Arity, Anno, #st{module = Module} = St) ->
-    {[], resolve(Module, Name, Arity, erlang, Anno, St), St};
+    Target = case St#st.imports of
+                 _ when is_map_key({Module, Name, Arity}, St#st.funs) ->
+                     resolve(Module, Name, Arity, Anno, St);
+                 #{{Name, Arity} := From} ->
+                     resolve(From, Name, Arity, Anno, St);
+                 _ ->
+                     resolve(erlang, Name, Arity, Anno, St) % auto-imported BIFs
+             end,
+    {[], Target, St};
 callee({remote, _, {atom, _, Module}, {atom, _, Name}}, Arity, Anno, St) ->
-    {[], resolve(Module, Name, Arity, Module, Anno, St), St};
+    {[], resolve(Module, Name, Arity, Anno, St), St};
 callee(Expr, _Arity, _Anno, St0) ->
     {Code, Ref, St1} = expr(Expr, St0),
     {Code, {apply, Ref}, St1}.
 
 %% A function of the program if there is one, otherwise a built-in.
-resolve(Module, Name, Arity, BifModule, Anno, St) ->
-    case maps:is_key({Module, Name, Arity}, St#st.funs) of
-        true -> {alku, alku_c:function_name(Module, Name, Arity)};
-        false -> {bif, builtin(BifModule, Name, Arity, Anno)}
+%% Other modules' functions must be exported.
+resolve(Module, Name, Arity, Anno, St) ->
+    Key = {Module, Name, Arity},
+    Exported = Module =:= St#st.module orelse maps:is_key(Key, St#st.exports),
+    case maps:is_key(Key, St#st.funs) of
+        true when Exported ->
+            {alku, alku_c:function_name(Module, Name, Arity)};
+        true ->
+            fail(Anno, io_lib:format("~s:~s/~b is not exported", [Module, Name, Arity]));
+        false ->
+            case bif(Module, Name, Arity) of
+                {ok, CFun} -> {bif, CFun};
+                error -> fail(Anno, missing(Module, Name, Arity, St))
+            end
+    end.
+
+missing(Module, Name, Arity, St) ->
+    UserModule = maps:is_key(Module, St#st.modules) andalso
+        not alku_stdlib:is_stdlib_module(Module),
+    Known = lists:member(Module, [erlang, io, file, math, binary, unicode]) orelse
+        maps:is_key(Module, St#st.modules),
+    if
+        UserModule ->
+            io_lib:format("function ~s:~s/~b is undefined", [Module, Name, Arity]);
+        Known ->
+            io_lib:format("~s:~s/~b is not available in Alku yet", [Module, Name, Arity]);
+        true ->
+            io_lib:format("module ~s not found: there is no ~s.erl next to the program",
+                          [Module, Module])
     end.
 
 %% A normal call: run any pending tail calls to get the real value.
@@ -540,6 +644,17 @@ compound({'catch', _, E}, St0) ->
       "} else {\n",
       R, " = alku_catch_value(alku_caught_class(), alku_caught_reason());\n",
       "}\n"], R, St3#st{vars = St2#st.vars}};
+compound({bin, _, Elements}, St0) ->
+    {B, St1} = fresh("builder", St0),
+    {Code, St2} = bin_elements(Elements, B, St1),
+    {CodeT, T, St3} = temp(["alku_bin_end(&", B, ")"], St2),
+    {["AlkuBinBuilder ", B, ";\n",
+      "alku_bin_begin(&", B, ");\n",
+      Code, CodeT], T, St3};
+compound({bc, Anno, Template, Qualifiers}, St) ->
+    %% << <<...>> || ... >> is list_to_binary([<<...>> || ...])
+    expr({call, Anno, {remote, Anno, {atom, Anno, erlang}, {atom, Anno, list_to_binary}},
+          [{lc, Anno, Template, Qualifiers}]}, St);
 compound({map, _, Fields}, St) ->
     map_fields("alku_map_new()", Fields, St);
 compound({map, _, Map, []}, St0) ->
@@ -588,6 +703,27 @@ compound({named_fun, _, Name, Clauses}, St) ->
     lambda(Name, Clauses, St);
 compound(E, _St) ->
     unsupported(E).
+
+%% The segments of <<...>>, appended to the builder B in order.
+bin_elements([], _B, St) ->
+    {[], St};
+bin_elements([{bin_element, A, {string, _, Chars}, Size, Type} | Rest], B, St) ->
+    bin_elements([{bin_element, A, {char, A, C}, Size, Type} || C <- Chars] ++ Rest, B, St);
+bin_elements([{bin_element, A, Value, Size, Specs} | Rest], B, St0) ->
+    {Type, Unit, Flags} = segment_type(Specs, A),
+    {ValueCode, ValueRef, St1} = expr(Value, St0),
+    {SizeCode, SizeRef, St2} = segment_size(Size, Type, St1),
+    Put = case Type of
+              integer -> ["alku_bin_put_integer(&", B, ", ", ValueRef, ", ", SizeRef, ", ",
+                          Unit, ", ", Flags, ");\n"];
+              float -> ["alku_bin_put_float(&", B, ", ", ValueRef, ", ", SizeRef, ", ",
+                        Unit, ", ", Flags, ");\n"];
+              binary -> ["alku_bin_put_binary(&", B, ", ", ValueRef, ", ", SizeRef, ", ",
+                         Unit, ");\n"];
+              utf8 -> ["alku_bin_put_utf8(&", B, ", ", ValueRef, ");\n"]
+          end,
+    {RestCode, St3} = bin_elements(Rest, B, St2),
+    {[ValueCode, SizeCode, Put, RestCode], St3}.
 
 %% Map#{K => V, K2 := V2}: => inserts or replaces, := requires the key.
 map_fields(Base, [], St) ->
@@ -643,6 +779,20 @@ list_comprehension(Template, [{generate, A, Pattern, List} | Qs], Acc, St0) ->
              [{call, A, Loop, [Tail, LoopAcc]}]},
             {clause, A, [{nil, A}, LoopAcc], [], [LoopAcc]}]},
     {{call, A, Fun, [List, Acc]}, St4};
+list_comprehension(Template, [{b_generate, A, {bin, BA, Segments}, Bin} | Qs], Acc, St0) ->
+    %% <<Segments>> <= Bin: match the segments, then loop on the rest
+    {LoopName, St1} = fresh_name("Lc@Loop", St0),
+    {RestName, St2} = fresh_name("Lc@Rest", St1),
+    {AccName, St3} = fresh_name("Lc@Acc", St2),
+    Loop = {var, A, LoopName},
+    Rest = {var, A, RestName},
+    LoopAcc = {var, A, AccName},
+    Pattern = {bin, BA, Segments ++ [{bin_element, A, Rest, default, [binary]}]},
+    {Inner, St4} = list_comprehension(Template, Qs, LoopAcc, St3),
+    Fun = {named_fun, A, LoopName,
+           [{clause, A, [Pattern, LoopAcc], [], [{call, A, Loop, [Rest, Inner]}]},
+            {clause, A, [{var, A, '_'}, LoopAcc], [], [LoopAcc]}]},
+    {{call, A, Fun, [Bin, Acc]}, St4};
 list_comprehension(Template, [{m_generate, A, {map_field_exact, _, K, V}, Map} | Qs], Acc, St) ->
     %% K := V <- Map loops over maps:to_list(Map)
     ToList = {call, A, {remote, A, {atom, A, maps}, {atom, A, to_list}}, [Map]},
@@ -664,7 +814,7 @@ fresh_name(Prefix, St0) ->
 %% adapter function.
 external_fun(Module, Name, Arity, Anno, St0) ->
     Display = io_lib:format("fun ~s:~s/~b", [Module, Name, Arity]),
-    case resolve(Module, Name, Arity, Module, Anno, St0) of
+    case resolve(Module, Name, Arity, Anno, St0) of
         {alku, CName} ->
             make_fun(CName, Arity, Display, [], St0);
         {bif, CFun} ->
@@ -804,102 +954,129 @@ unary_op(Op, Anno) ->
     fail(Anno, io_lib:format("the ~s operator is not supported yet", [Op])).
 
 %% Built-in functions: {Module, Name, Arity} => C function in the runtime.
-builtin(erlang, is_integer, 1, _) -> "alku_bif_is_integer";
-builtin(erlang, is_atom, 1, _) -> "alku_bif_is_atom";
-builtin(erlang, is_boolean, 1, _) -> "alku_bif_is_boolean";
-builtin(erlang, is_list, 1, _) -> "alku_bif_is_list";
-builtin(erlang, is_tuple, 1, _) -> "alku_bif_is_tuple";
-builtin(erlang, is_function, 1, _) -> "alku_bif_is_function_1";
-builtin(erlang, is_function, 2, _) -> "alku_bif_is_function_2";
-builtin(erlang, abs, 1, _) -> "alku_bif_abs";
-builtin(erlang, hd, 1, _) -> "alku_bif_hd";
-builtin(erlang, tl, 1, _) -> "alku_bif_tl";
-builtin(erlang, length, 1, _) -> "alku_bif_length";
-builtin(erlang, element, 2, _) -> "alku_bif_element";
-builtin(erlang, setelement, 3, _) -> "alku_bif_setelement";
-builtin(erlang, tuple_size, 1, _) -> "alku_bif_tuple_size";
-builtin(erlang, integer_to_list, 1, _) -> "alku_bif_integer_to_list";
-builtin(erlang, atom_to_list, 1, _) -> "alku_bif_atom_to_list";
-builtin(erlang, list_to_integer, 1, _) -> "alku_bif_list_to_integer";
-builtin(erlang, list_to_integer, 2, _) -> "alku_bif_list_to_integer_2";
-builtin(erlang, integer_to_list, 2, _) -> "alku_bif_integer_to_list_2";
-builtin(erlang, is_float, 1, _) -> "alku_bif_is_float";
-builtin(erlang, is_number, 1, _) -> "alku_bif_is_number";
-builtin(erlang, float, 1, _) -> "alku_bif_float";
-builtin(erlang, round, 1, _) -> "alku_bif_round";
-builtin(erlang, trunc, 1, _) -> "alku_bif_trunc";
-builtin(erlang, floor, 1, _) -> "alku_bif_floor";
-builtin(erlang, ceil, 1, _) -> "alku_bif_ceil";
-builtin(erlang, float_to_list, 1, _) -> "alku_bif_float_to_list_1";
-builtin(erlang, float_to_list, 2, _) -> "alku_bif_float_to_list_2";
-builtin(erlang, list_to_float, 1, _) -> "alku_bif_list_to_float";
-builtin(erlang, is_map, 1, _) -> "alku_bif_is_map";
-builtin(erlang, map_size, 1, _) -> "alku_bif_map_size";
-builtin(erlang, is_map_key, 2, _) -> "alku_bif_is_map_key";
-builtin(erlang, map_get, 2, _) -> "alku_bif_map_get";
-builtin(erlang, is_record, 2, _) -> "alku_bif_is_record_2";
-builtin(erlang, is_record, 3, _) -> "alku_bif_is_record_3";
-builtin(math, pi, 0, _) -> "alku_math_pi";
-builtin(math, sqrt, 1, _) -> "alku_math_sqrt";
-builtin(math, pow, 2, _) -> "alku_math_pow";
-builtin(math, exp, 1, _) -> "alku_math_exp";
-builtin(math, log, 1, _) -> "alku_math_log";
-builtin(math, log2, 1, _) -> "alku_math_log2";
-builtin(math, log10, 1, _) -> "alku_math_log10";
-builtin(math, sin, 1, _) -> "alku_math_sin";
-builtin(math, cos, 1, _) -> "alku_math_cos";
-builtin(math, tan, 1, _) -> "alku_math_tan";
-builtin(math, asin, 1, _) -> "alku_math_asin";
-builtin(math, acos, 1, _) -> "alku_math_acos";
-builtin(math, atan, 1, _) -> "alku_math_atan";
-builtin(math, atan2, 2, _) -> "alku_math_atan2";
-builtin(math, floor, 1, _) -> "alku_math_floor";
-builtin(math, ceil, 1, _) -> "alku_math_ceil";
-builtin(maps, new, 0, _) -> "alku_maps_new";
-builtin(maps, get, 2, _) -> "alku_maps_get_2";
-builtin(maps, get, 3, _) -> "alku_maps_get_3";
-builtin(maps, put, 3, _) -> "alku_maps_put";
-builtin(maps, update, 3, _) -> "alku_maps_update";
-builtin(maps, remove, 2, _) -> "alku_maps_remove";
-builtin(maps, is_key, 2, _) -> "alku_maps_is_key";
-builtin(maps, find, 2, _) -> "alku_maps_find";
-builtin(maps, keys, 1, _) -> "alku_maps_keys";
-builtin(maps, values, 1, _) -> "alku_maps_values";
-builtin(maps, to_list, 1, _) -> "alku_maps_to_list";
-builtin(maps, from_list, 1, _) -> "alku_maps_from_list";
-builtin(maps, size, 1, _) -> "alku_maps_size";
-builtin(maps, merge, 2, _) -> "alku_maps_merge";
-builtin(erlang, list_to_atom, 1, _) -> "alku_bif_list_to_atom";
-builtin(erlang, tuple_to_list, 1, _) -> "alku_bif_tuple_to_list";
-builtin(erlang, list_to_tuple, 1, _) -> "alku_bif_list_to_tuple";
-builtin(erlang, max, 2, _) -> "alku_bif_max";
-builtin(erlang, min, 2, _) -> "alku_bif_min";
-builtin(erlang, apply, 2, _) -> "alku_bif_apply_2";
-builtin(erlang, throw, 1, _) -> "alku_bif_throw";
-builtin(erlang, error, 1, _) -> "alku_bif_error_1";
-builtin(erlang, error, 2, _) -> "alku_bif_error_2";
-builtin(erlang, exit, 1, _) -> "alku_bif_exit";
-builtin(erlang, halt, 0, _) -> "alku_bif_halt_0";
-builtin(erlang, halt, 1, _) -> "alku_bif_halt_1";
-builtin(lists, reverse, 1, _) -> "alku_lists_reverse_1";
-builtin(lists, reverse, 2, _) -> "alku_lists_reverse_2";
-builtin(io, write, 1, _) -> "alku_io_write";
-builtin(io, write, 2, _) -> "alku_io_write_2";
-builtin(io, nl, 0, _) -> "alku_io_nl";
-builtin(io, nl, 1, _) -> "alku_io_nl_1";
-builtin(io, format, 1, _) -> "alku_io_format_1";
-builtin(io, format, 2, _) -> "alku_io_format_2";
-builtin(io, format, 3, _) -> "alku_io_format_3";
-builtin(io, put_chars, 1, _) -> "alku_io_put_chars_1";
-builtin(io, put_chars, 2, _) -> "alku_io_put_chars_2";
-builtin(io, get_line, 1, _) -> "alku_io_get_line_1";
-builtin(io, get_line, 2, _) -> "alku_io_get_line_2";
-builtin(file, open, 2, _) -> "alku_file_open";
-builtin(file, close, 1, _) -> "alku_file_close";
-builtin(file, write_file, 2, _) -> "alku_file_write_file";
-builtin(Module, Name, Arity, Anno) ->
-    fail(Anno, io_lib:format("~s:~s/~b is not available in Alku yet",
-                             [Module, Name, Arity])).
+bif(erlang, is_binary, 1) -> {ok, "alku_bif_is_binary"};
+bif(erlang, is_bitstring, 1) -> {ok, "alku_bif_is_binary"};
+bif(erlang, byte_size, 1) -> {ok, "alku_bif_byte_size"};
+bif(erlang, bit_size, 1) -> {ok, "alku_bif_bit_size"};
+bif(erlang, binary_to_list, 1) -> {ok, "alku_bif_binary_to_list"};
+bif(erlang, list_to_binary, 1) -> {ok, "alku_bif_list_to_binary"};
+bif(erlang, iolist_to_binary, 1) -> {ok, "alku_bif_list_to_binary"};
+bif(erlang, iolist_size, 1) -> {ok, "alku_bif_iolist_size"};
+bif(erlang, binary_part, 3) -> {ok, "alku_bif_binary_part"};
+bif(erlang, split_binary, 2) -> {ok, "alku_bif_split_binary"};
+bif(erlang, atom_to_binary, 1) -> {ok, "alku_bif_atom_to_binary_1"};
+bif(erlang, atom_to_binary, 2) -> {ok, "alku_bif_atom_to_binary_2"};
+bif(erlang, binary_to_atom, 1) -> {ok, "alku_bif_binary_to_atom_1"};
+bif(erlang, binary_to_atom, 2) -> {ok, "alku_bif_binary_to_atom_2"};
+bif(erlang, integer_to_binary, 1) -> {ok, "alku_bif_integer_to_binary_1"};
+bif(erlang, integer_to_binary, 2) -> {ok, "alku_bif_integer_to_binary_2"};
+bif(erlang, binary_to_integer, 1) -> {ok, "alku_bif_binary_to_integer_1"};
+bif(erlang, binary_to_integer, 2) -> {ok, "alku_bif_binary_to_integer_2"};
+bif(binary, split, 2) -> {ok, "alku_binary_split_2"};
+bif(binary, split, 3) -> {ok, "alku_binary_split_3"};
+bif(binary, part, 3) -> {ok, "alku_binary_part"};
+bif(binary, at, 2) -> {ok, "alku_binary_at"};
+bif(binary, first, 1) -> {ok, "alku_binary_first"};
+bif(binary, last, 1) -> {ok, "alku_binary_last"};
+bif(binary, bin_to_list, 1) -> {ok, "alku_bif_binary_to_list"};
+bif(binary, list_to_bin, 1) -> {ok, "alku_bif_list_to_binary"};
+bif(unicode, characters_to_binary, 1) -> {ok, "alku_unicode_characters_to_binary"};
+bif(unicode, characters_to_list, 1) -> {ok, "alku_unicode_characters_to_list"};
+bif(file, read_file, 1) -> {ok, "alku_file_read_file"};
+bif(erlang, is_integer, 1) -> {ok, "alku_bif_is_integer"};
+bif(erlang, is_atom, 1) -> {ok, "alku_bif_is_atom"};
+bif(erlang, is_boolean, 1) -> {ok, "alku_bif_is_boolean"};
+bif(erlang, is_list, 1) -> {ok, "alku_bif_is_list"};
+bif(erlang, is_tuple, 1) -> {ok, "alku_bif_is_tuple"};
+bif(erlang, is_function, 1) -> {ok, "alku_bif_is_function_1"};
+bif(erlang, is_function, 2) -> {ok, "alku_bif_is_function_2"};
+bif(erlang, abs, 1) -> {ok, "alku_bif_abs"};
+bif(erlang, hd, 1) -> {ok, "alku_bif_hd"};
+bif(erlang, tl, 1) -> {ok, "alku_bif_tl"};
+bif(erlang, length, 1) -> {ok, "alku_bif_length"};
+bif(erlang, element, 2) -> {ok, "alku_bif_element"};
+bif(erlang, setelement, 3) -> {ok, "alku_bif_setelement"};
+bif(erlang, tuple_size, 1) -> {ok, "alku_bif_tuple_size"};
+bif(erlang, integer_to_list, 1) -> {ok, "alku_bif_integer_to_list"};
+bif(erlang, atom_to_list, 1) -> {ok, "alku_bif_atom_to_list"};
+bif(erlang, list_to_integer, 1) -> {ok, "alku_bif_list_to_integer"};
+bif(erlang, list_to_integer, 2) -> {ok, "alku_bif_list_to_integer_2"};
+bif(erlang, integer_to_list, 2) -> {ok, "alku_bif_integer_to_list_2"};
+bif(erlang, is_float, 1) -> {ok, "alku_bif_is_float"};
+bif(erlang, is_number, 1) -> {ok, "alku_bif_is_number"};
+bif(erlang, float, 1) -> {ok, "alku_bif_float"};
+bif(erlang, round, 1) -> {ok, "alku_bif_round"};
+bif(erlang, trunc, 1) -> {ok, "alku_bif_trunc"};
+bif(erlang, floor, 1) -> {ok, "alku_bif_floor"};
+bif(erlang, ceil, 1) -> {ok, "alku_bif_ceil"};
+bif(erlang, float_to_list, 1) -> {ok, "alku_bif_float_to_list_1"};
+bif(erlang, float_to_list, 2) -> {ok, "alku_bif_float_to_list_2"};
+bif(erlang, list_to_float, 1) -> {ok, "alku_bif_list_to_float"};
+bif(erlang, is_map, 1) -> {ok, "alku_bif_is_map"};
+bif(erlang, map_size, 1) -> {ok, "alku_bif_map_size"};
+bif(erlang, is_map_key, 2) -> {ok, "alku_bif_is_map_key"};
+bif(erlang, map_get, 2) -> {ok, "alku_bif_map_get"};
+bif(erlang, is_record, 2) -> {ok, "alku_bif_is_record_2"};
+bif(erlang, is_record, 3) -> {ok, "alku_bif_is_record_3"};
+bif(math, pi, 0) -> {ok, "alku_math_pi"};
+bif(math, sqrt, 1) -> {ok, "alku_math_sqrt"};
+bif(math, pow, 2) -> {ok, "alku_math_pow"};
+bif(math, exp, 1) -> {ok, "alku_math_exp"};
+bif(math, log, 1) -> {ok, "alku_math_log"};
+bif(math, log2, 1) -> {ok, "alku_math_log2"};
+bif(math, log10, 1) -> {ok, "alku_math_log10"};
+bif(math, sin, 1) -> {ok, "alku_math_sin"};
+bif(math, cos, 1) -> {ok, "alku_math_cos"};
+bif(math, tan, 1) -> {ok, "alku_math_tan"};
+bif(math, asin, 1) -> {ok, "alku_math_asin"};
+bif(math, acos, 1) -> {ok, "alku_math_acos"};
+bif(math, atan, 1) -> {ok, "alku_math_atan"};
+bif(math, atan2, 2) -> {ok, "alku_math_atan2"};
+bif(math, floor, 1) -> {ok, "alku_math_floor"};
+bif(math, ceil, 1) -> {ok, "alku_math_ceil"};
+bif(maps, new, 0) -> {ok, "alku_maps_new"};
+bif(maps, get, 2) -> {ok, "alku_maps_get_2"};
+bif(maps, get, 3) -> {ok, "alku_maps_get_3"};
+bif(maps, put, 3) -> {ok, "alku_maps_put"};
+bif(maps, update, 3) -> {ok, "alku_maps_update"};
+bif(maps, remove, 2) -> {ok, "alku_maps_remove"};
+bif(maps, is_key, 2) -> {ok, "alku_maps_is_key"};
+bif(maps, find, 2) -> {ok, "alku_maps_find"};
+bif(maps, keys, 1) -> {ok, "alku_maps_keys"};
+bif(maps, values, 1) -> {ok, "alku_maps_values"};
+bif(maps, to_list, 1) -> {ok, "alku_maps_to_list"};
+bif(maps, from_list, 1) -> {ok, "alku_maps_from_list"};
+bif(maps, size, 1) -> {ok, "alku_maps_size"};
+bif(maps, merge, 2) -> {ok, "alku_maps_merge"};
+bif(erlang, list_to_atom, 1) -> {ok, "alku_bif_list_to_atom"};
+bif(erlang, tuple_to_list, 1) -> {ok, "alku_bif_tuple_to_list"};
+bif(erlang, list_to_tuple, 1) -> {ok, "alku_bif_list_to_tuple"};
+bif(erlang, max, 2) -> {ok, "alku_bif_max"};
+bif(erlang, min, 2) -> {ok, "alku_bif_min"};
+bif(erlang, apply, 2) -> {ok, "alku_bif_apply_2"};
+bif(erlang, throw, 1) -> {ok, "alku_bif_throw"};
+bif(erlang, error, 1) -> {ok, "alku_bif_error_1"};
+bif(erlang, error, 2) -> {ok, "alku_bif_error_2"};
+bif(erlang, exit, 1) -> {ok, "alku_bif_exit"};
+bif(erlang, halt, 0) -> {ok, "alku_bif_halt_0"};
+bif(erlang, halt, 1) -> {ok, "alku_bif_halt_1"};
+bif(lists, reverse, 1) -> {ok, "alku_lists_reverse_1"};
+bif(lists, reverse, 2) -> {ok, "alku_lists_reverse_2"};
+bif(io, write, 1) -> {ok, "alku_io_write"};
+bif(io, write, 2) -> {ok, "alku_io_write_2"};
+bif(io, nl, 0) -> {ok, "alku_io_nl"};
+bif(io, nl, 1) -> {ok, "alku_io_nl_1"};
+bif(io, format, 1) -> {ok, "alku_io_format_1"};
+bif(io, format, 2) -> {ok, "alku_io_format_2"};
+bif(io, format, 3) -> {ok, "alku_io_format_3"};
+bif(io, put_chars, 1) -> {ok, "alku_io_put_chars_1"};
+bif(io, put_chars, 2) -> {ok, "alku_io_put_chars_2"};
+bif(io, get_line, 1) -> {ok, "alku_io_get_line_1"};
+bif(io, get_line, 2) -> {ok, "alku_io_get_line_2"};
+bif(file, open, 2) -> {ok, "alku_file_open"};
+bif(file, close, 1) -> {ok, "alku_file_close"};
+bif(file, write_file, 2) -> {ok, "alku_file_write_file"};
+bif(_Module, _Name, _Arity) -> error.
 
 %% ---------- State and errors ----------
 
@@ -919,12 +1096,11 @@ temp(CExpr, St0) ->
     {["Value ", T, " = ", CExpr, ";\n"], T, St1}.
 
 unsupported(E) ->
-    What = case element(1, E) of
-               bin -> "binaries are";
-               'receive' -> "receive expressions are (Alku has no processes)";
-               _ -> "this kind of expression or pattern is"
-           end,
-    fail(element(2, E), [What, " not supported in Alku yet"]).
+    Message = case element(1, E) of
+                  'receive' -> "receive is not supported: Alku has no processes";
+                  _ -> "this kind of expression or pattern is not supported in Alku yet"
+              end,
+    fail(element(2, E), Message).
 
 %% Anno is an erl_anno() or a plain line number.
 fail(Anno, Message) ->

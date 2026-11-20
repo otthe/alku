@@ -21,7 +21,7 @@
 #include <stdint.h>
 
 /* Tags are declared in Erlang term order:
- * number < atom < fun < pid < tuple < map < nil < list.
+ * number < atom < fun < pid < tuple < map < nil < list < binary.
  * The three number tags compare by numeric value. */
 typedef enum {
     ALKU_INT,   /* integer that fits in 64 bits */
@@ -34,6 +34,7 @@ typedef enum {
     ALKU_MAP,
     ALKU_NIL,
     ALKU_CONS,
+    ALKU_BINARY,
     ALKU_PENDING /* not a term: marks a pending tail call */
 } AlkuTag;
 
@@ -42,6 +43,7 @@ typedef struct AlkuCons AlkuCons;
 typedef struct AlkuFun AlkuFun;
 typedef struct AlkuBig AlkuBig;
 typedef struct AlkuMapNode AlkuMapNode;
+typedef struct AlkuBinary AlkuBinary;
 
 typedef struct {
     AlkuTag tag;
@@ -54,6 +56,7 @@ typedef struct {
         AlkuCons *cons;
         AlkuFun *fun;
         AlkuMapNode *map; /* root of a balanced tree; NULL for #{} */
+        AlkuBinary *binary;
     } as;
 } Value;
 
@@ -78,6 +81,16 @@ struct AlkuMapNode {
     Value key;
     Value value;
     AlkuMapNode *left, *right;
+};
+
+/* A binary: size bytes at bytes. A binary owns its bytes (they follow
+ * the struct in data) or, as a sub-binary made by matching, points into
+ * the bytes of its parent. */
+struct AlkuBinary {
+    size_t size;
+    const unsigned char *bytes;
+    AlkuBinary *parent; /* NULL when the bytes are in data */
+    unsigned char data[];
 };
 
 /* One list cell: [head | tail] */
@@ -194,6 +207,36 @@ Value alku_map_check(Value map);                          /* M#{} */
 bool alku_is_map(Value v);
 bool alku_map_lookup(Value map, Value key, Value *value);  /* for patterns */
 
+/* Binaries: building <<...>> and matching it in patterns.
+ * Sizes are given in units (a segment is size * unit bits). */
+#define ALKU_BIN_SIGNED 1
+#define ALKU_BIN_LITTLE 2
+
+typedef struct {
+    unsigned char *data;
+    size_t bits, capacity;
+} AlkuBinBuilder;
+
+typedef struct {
+    const AlkuBinary *binary;
+    size_t pos, bits; /* bit position and total bits */
+} AlkuBinMatch;
+
+void alku_bin_begin(AlkuBinBuilder *b);
+void alku_bin_put_integer(AlkuBinBuilder *b, Value v, Value size, unsigned unit, int flags);
+void alku_bin_put_float(AlkuBinBuilder *b, Value v, Value size, unsigned unit, int flags);
+void alku_bin_put_binary(AlkuBinBuilder *b, Value v, Value size, unsigned unit); /* size all: whole */
+void alku_bin_put_utf8(AlkuBinBuilder *b, Value v);
+Value alku_bin_end(AlkuBinBuilder *b);
+
+bool alku_bin_match_start(AlkuBinMatch *m, Value v);
+bool alku_bin_get_integer(AlkuBinMatch *m, Value size, unsigned unit, int flags, Value *out);
+bool alku_bin_get_float(AlkuBinMatch *m, Value size, unsigned unit, int flags, Value *out);
+bool alku_bin_get_binary(AlkuBinMatch *m, Value size, unsigned unit, Value *out);
+bool alku_bin_get_rest(AlkuBinMatch *m, Value *out);
+bool alku_bin_get_utf8(AlkuBinMatch *m, Value *out);
+bool alku_bin_match_end(AlkuBinMatch *m);
+
 /* Built-in functions */
 Value alku_bif_is_integer(Value v);
 Value alku_bif_is_atom(Value v);
@@ -235,6 +278,31 @@ Value alku_maps_to_list(Value map);
 Value alku_maps_from_list(Value list);
 Value alku_maps_size(Value map);
 Value alku_maps_merge(Value a, Value b);
+Value alku_bif_is_binary(Value v);
+Value alku_bif_byte_size(Value v);
+Value alku_bif_bit_size(Value v);
+Value alku_bif_binary_to_list(Value v);
+Value alku_bif_list_to_binary(Value v);
+Value alku_bif_iolist_size(Value v);
+Value alku_bif_binary_part(Value bin, Value start, Value length);
+Value alku_bif_split_binary(Value bin, Value pos);
+Value alku_bif_atom_to_binary_1(Value atom);
+Value alku_bif_atom_to_binary_2(Value atom, Value encoding);
+Value alku_bif_binary_to_atom_1(Value bin);
+Value alku_bif_binary_to_atom_2(Value bin, Value encoding);
+Value alku_bif_integer_to_binary_1(Value n);
+Value alku_bif_integer_to_binary_2(Value n, Value base);
+Value alku_bif_binary_to_integer_1(Value bin);
+Value alku_bif_binary_to_integer_2(Value bin, Value base);
+Value alku_unicode_characters_to_binary(Value chars);
+Value alku_unicode_characters_to_list(Value data);
+Value alku_binary_split_2(Value bin, Value pattern);
+Value alku_binary_split_3(Value bin, Value pattern, Value options);
+Value alku_binary_part(Value bin, Value start, Value length);
+Value alku_binary_at(Value bin, Value pos);
+Value alku_binary_first(Value bin);
+Value alku_binary_last(Value bin);
+Value alku_file_read_file(Value name);
 Value alku_math_pi(void);
 Value alku_math_sqrt(Value x);
 Value alku_math_pow(Value x, Value y);

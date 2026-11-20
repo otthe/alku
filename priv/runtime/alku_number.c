@@ -158,6 +158,9 @@ static void mag_divmod(const uint32_t *u, size_t m, const uint32_t *v, size_t n,
     free(un);
 }
 
+static uint32_t *twos_complement(Value v, size_t n);
+static Value from_twos_complement(uint32_t *limbs, size_t n);
+
 /* ---------- Integers ---------- */
 
 /* A read-only view of an integer's sign and magnitude. Fixnums are
@@ -387,6 +390,48 @@ void print_integer(Buffer *b, Value v, unsigned base, bool lowercase) {
     while (count > 0) buf_putc(b, digits[--count]);
     free(digits);
     free(mag);
+}
+
+/* The low n bytes of v in two's complement, most significant first. */
+void integer_to_be_bytes(Value v, unsigned char *out, size_t n) {
+    size_t limbs = n / 4 + 2;
+    if (v.tag == ALKU_INT) {
+        uint64_t u = (uint64_t)v.as.integer;
+        for (size_t i = 0; i < n; i++) {
+            out[n - 1 - i] = i < 8 ? (unsigned char)(u >> (8 * i)) : (v.as.integer < 0 ? 0xFF : 0);
+        }
+        return;
+    }
+    if (limbs < v.as.big->length + 1) limbs = v.as.big->length + 1;
+    uint32_t *t = twos_complement(v, limbs);
+    for (size_t i = 0; i < n; i++) {
+        size_t limb = i / 4;
+        uint32_t word = limb < limbs ? t[limb] : (v.as.big->negative ? 0xFFFFFFFF : 0);
+        out[n - 1 - i] = (unsigned char)(word >> (8 * (i % 4)));
+    }
+    free(t);
+}
+
+/* The integer in n bytes, most significant first. */
+Value integer_from_be_bytes(const unsigned char *in, size_t n, bool is_signed) {
+    if (n <= 7 || (n == 8 && is_signed)) {
+        uint64_t u = 0;
+        for (size_t i = 0; i < n; i++) u = (u << 8) | in[i];
+        if (is_signed && n > 0 && (in[0] & 0x80)) {
+            u |= n == 8 ? 0 : ~(uint64_t)0 << (8 * n); /* sign-extend */
+        }
+        return alku_int((int64_t)u);
+    }
+    size_t limbs = n / 4 + 2;
+    uint32_t *t = new_limbs(limbs);
+    bool negative = is_signed && n > 0 && (in[0] & 0x80);
+    for (size_t i = 0; i < limbs * 4; i++) {
+        unsigned char byte = i < n ? in[n - 1 - i] : (negative ? 0xFF : 0);
+        t[i / 4] |= (uint32_t)byte << (8 * (i % 4));
+    }
+    Value result = from_twos_complement(t, limbs);
+    free(t);
+    return result;
 }
 
 /* ---------- Floats ---------- */

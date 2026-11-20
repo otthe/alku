@@ -1,7 +1,8 @@
 %% @doc Compiles and runs every program in examples/ and compares what it
 %% prints (or the compile errors) with the matching .expected file.
 %%
-%% To add a test, drop NAME.erl and NAME.expected into examples/.
+%% To add a test, drop NAME.erl and NAME.expected into examples/. Files
+%% without a .expected file are helper modules used by the programs.
 %% Optional: NAME.input is given to the program as stdin, and NAME.args
 %% holds its command-line arguments, one per line.
 %% Paths are relative to the project root, where rebar3 eunit runs.
@@ -12,7 +13,8 @@
 -define(EXAMPLES, "examples").
 
 examples_test_() ->
-    Sources = filelib:wildcard(filename:join(?EXAMPLES, "*.erl")),
+    Sources = [Src || Src <- filelib:wildcard(filename:join(?EXAMPLES, "*.erl")),
+                      filelib:is_regular(filename:rootname(Src) ++ ".expected")],
     [{Src, {timeout, 120, fun() -> check(Src) end}} || Src <- Sources].
 
 %% Each program runs twice: normally, and with the garbage collector

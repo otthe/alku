@@ -42,11 +42,21 @@ alku c FILE.erl                   # show the generated C code
 you can put it on your PATH, e.g.
 `ln -s "$PWD/_build/default/bin/alku" ~/.local/bin/alku`.
 
-## What works now (phase 5)
+## What works now (phase 6)
 
 - Integers of any size (small ones are fast; big ones grow as needed),
   floats, atoms, tuples, lists, strings (lists of character codes, as in
-  Erlang), maps, records and funs
+  Erlang), binaries, maps, records and funs
+- **Programs of several modules**: when a module calls `shapes:area(X)`,
+  `alku` compiles `shapes.erl` from the same directory too (and the
+  modules that one uses). Calls to unexported functions and missing
+  modules are compile errors. `-import` works.
+- **Binaries and the bit syntax**: `<<1, 300:16, X/binary>>`, patterns
+  like `<<Len:16, Data:Len/binary, Rest/binary>>`, segments of any bit
+  size, `integer`/`float`/`binary`/`utf8`, `signed`, `little`, `unit:N`,
+  binary comprehensions `<< <<X>> || <<X>> <= B >>` and binary generators.
+  Matching shares memory instead of copying. A whole binary must be a
+  whole number of bytes (no bitstrings)
 - Functions with multiple clauses, pattern matching and guards (`,` and `;`)
 - Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`, `P1 = P2`,
   repeated variables
@@ -88,11 +98,18 @@ you can put it on your PATH, e.g.
   floor ceil`
 - `maps`: `new get put update remove is_key find keys values to_list
   from_list size merge fold map filter foreach update_with with without`
+- Binaries: `is_binary/1`, `byte_size/1`, `bit_size/1`,
+  `binary_to_list/1`, `list_to_binary/1`, `iolist_to_binary/1`,
+  `iolist_size/1`, `binary_part/3`, `split_binary/2`, `atom_to_binary/1,2`,
+  `binary_to_atom/1,2`, `integer_to_binary/1,2`, `binary_to_integer/1,2`,
+  `binary:split/2,3 part/3 at/2 first/1 last/1`,
+  `unicode:characters_to_binary/1`, `unicode:characters_to_list/1`
 - Programs: `main/1` receives the command-line arguments as strings
   (`main/0` also works)
 - I/O: `io:format/1,2,3`, `io:put_chars/1,2`, `io:write/1,2`,
   `io:nl/0,1`, `io:get_line/1,2`, `file:open/2` (read, write, append),
-  `file:close/1`, `file:write_file/2`
+  `file:close/1`, `file:read_file/1`, `file:write_file/2` (which writes
+  bytes, as in Erlang: use `unicode:characters_to_binary/1` for text)
 - Standard library `lists`: `all any append duplicate filter flatten foldl
   foldr foreach last map max member min nth reverse seq sort sum zip`
 - Standard library `string`: `is_empty join lowercase split tokens
@@ -107,8 +124,8 @@ the same output under `erl`. Differences: `~p` never breaks long terms
 over several lines, and maps with more than 32 keys print in key order
 (Erlang uses hash order for those).
 
-Not yet: binaries (so no `file:read_file/1`), stack traces,
-`"abc" ++ Rest` patterns, `~g`, programs made of several modules.
+Not yet: bitstrings, utf16/utf32 segments, stack traces, `"abc" ++ Rest`
+patterns, `~g`, string functions on binaries.
 
 ## How the runtime works
 
@@ -120,6 +137,9 @@ Not yet: binaries (so no `file:read_file/1`), stack traces,
   long division). Floats print exactly as Erlang prints them.
 - **Maps** (`alku_map.c`): persistent weight-balanced trees, so an update
   costs O(log n) and never changes the old map.
+- **Binaries** (`alku_binary.c`): a binary owns its bytes, or (when made by
+  matching) points into another binary's bytes, so `<<X, Rest/binary>>`
+  loops run in linear time.
 - **Calls**: every Alku function and fun body is a C function taking its
   arguments as an array. A call in tail position to the function itself
   becomes a `goto` back to its start. Any other tail call returns a
@@ -137,7 +157,7 @@ Not yet: binaries (so no `file:read_file/1`), stack traces,
 | Path | What it does |
 |---|---|
 | `src/alku.erl` | Command-line tool |
-| `src/alku_compiler.erl` | The pipeline: frontend → codegen → C compiler |
+| `src/alku_compiler.erl` | The pipeline: finds the program's modules, then frontend → codegen → C compiler |
 | `src/alku_frontend.erl` | Parses with `epp` and checks with `erl_lint` |
 | `src/alku_codegen.erl` | Turns Erlang abstract syntax into C (tail calls, funs) |
 | `src/alku_c.erl` | Helpers for C names, literals and indentation |
@@ -148,7 +168,7 @@ Not yet: binaries (so no `file:read_file/1`), stack traces,
 | `priv/runtime/` | The C runtime: values, numbers, maps, calls, errors, GC |
 | `priv/stdlib/` | The standard library, written in Alku |
 | `test/` | Unit tests |
-| `examples/` | Example programs with their expected output (also tests) |
+| `examples/` | Example programs with their expected output (also tests); `.erl` files without `.expected` are helper modules |
 
 ## Tests
 
