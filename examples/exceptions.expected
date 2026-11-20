@@ -1,0 +1,14 @@
+{ok,3} {error,division_by_zero}
+2 default
+positive_head other other
+thrown
+{'EXIT',bye}
+3
+caught_badarg
+working
+cleanup done
+{caught,oops}
+{error,{my,error}}
+no_such_element
+{badmatch,{error,1}}
+** exception error: unhandled

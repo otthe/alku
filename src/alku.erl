@@ -5,21 +5,21 @@
 
 -define(USAGE,
 "usage:
-  alku run FILE.erl              compile and run a program
+  alku run FILE.erl [ARGS...]    compile and run a program
   alku build FILE.erl [-o OUT]   compile a program into an executable
   alku c FILE.erl                print the generated C code
 ").
 
-main(["run", Src]) -> run(Src);
+main(["run", Src | Args]) -> run(Src, Args);
 main(["build", Src]) -> build(Src, filename:rootname(Src));
 main(["build", Src, "-o", Exe]) -> build(Src, Exe);
 main(["c", Src]) -> emit_c(Src);
 main(_) -> io:put_chars(standard_error, ?USAGE), halt(2).
 
-run(Src) ->
+run(Src, Args) ->
     Exe = alku_os:temp_file("alku_run"),
     compile_or_halt(Src, Exe),
-    {Status, ok} = alku_os:run(Exe, [], [], fun(Data, ok) -> io:put_chars(Data) end, ok),
+    Status = alku_os:run_interactive(Exe, Args),
     _ = file:delete(Exe),
     halt(Status).
 

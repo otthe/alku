@@ -1,7 +1,7 @@
 %% @doc Running external programs and creating temporary file names.
 -module(alku_os).
 
--export([run/2, run/3, run/5, temp_file/1]).
+-export([run/2, run/3, run/5, run_interactive/2, temp_file/1]).
 
 -type env() :: [{string(), string()}].
 
@@ -25,6 +25,19 @@ run(Exe, Args, Env, Fun, Acc0) ->
                      [{args, Args}, {env, Env}, binary, exit_status,
                       stderr_to_stdout, use_stdio]),
     collect(Port, Fun, Acc0).
+
+%% Runs Exe connected directly to this terminal (its stdin, stdout and
+%% stderr), so interactive programs work. Returns the exit status.
+-spec run_interactive(file:filename(), [string()]) -> non_neg_integer().
+run_interactive(Exe, Args) ->
+    Port = open_port({spawn_executable, Exe}, [{args, Args}, exit_status, nouse_stdio]),
+    wait_for_exit(Port).
+
+wait_for_exit(Port) ->
+    receive
+        {Port, {exit_status, Status}} -> Status;
+        {Port, _} -> wait_for_exit(Port)
+    end.
 
 collect(Port, Fun, Acc) ->
     receive

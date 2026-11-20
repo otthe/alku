@@ -1,6 +1,7 @@
 #include "alku_runtime.h"
 #include "alku_gc.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -165,6 +166,11 @@ static void print_value(Buffer *b, Value v, bool pretty) {
             buf_putc(b, '>');
         }
         break;
+    case ALKU_PID: /* an open file */
+        buf_puts(b, "<0.");
+        buf_int(b, 80 + v.as.integer);
+        buf_puts(b, ".0>");
+        break;
     case ALKU_PENDING:
         buf_puts(b, "<pending call>"); /* never seen by Alku code */
         break;
@@ -199,84 +205,190 @@ static void print_value(Buffer *b, Value v, bool pretty) {
     }
 }
 
-/* ---------- Errors ---------- */
+static bool is_atom_named(Value v, const char *name);
+static char *c_string(Value chars);
 
-/* Prints "** exception error: <message>" and exits. Values in the message
- * are passed as Value pointers and written with "%v". */
-static _Noreturn void fail(const char *format, ...) {
-    Buffer b = {0};
-    buf_puts(&b, "** exception error: ");
-    va_list args;
-    va_start(args, format);
-    for (const char *f = format; *f != '\0'; f++) {
-        if (f[0] == '%' && f[1] == 'v') {
-            print_value(&b, *va_arg(args, const Value *), true);
-            f++;
-        } else {
-            buf_putc(&b, *f);
-        }
+/* ---------- Exceptions ---------- */
+
+/* try/catch pushes a handler (a jmp_buf on the C stack); raising an
+ * exception jumps to the innermost one. The caught class and reason are
+ * kept in globals, which stay valid across longjmp. */
+static AlkuHandler *handlers;
+static Value caught_class, caught_reason;
+
+/* Extra details for the message printed when an error is not caught. */
+static struct {
+    const char *function; /* function_clause: the function's name */
+    Value args;           /* ... and its arguments, as a list */
+    bool has_detail;      /* badarg: the offending value */
+    Value detail;
+} error_info;
+
+void alku_try(AlkuHandler *h) {
+    h->prev = handlers;
+    handlers = h;
+}
+
+void alku_end_try(AlkuHandler *h) {
+    handlers = h->prev;
+}
+
+Value alku_caught_class(void) { return caught_class; }
+Value alku_caught_reason(void) { return caught_reason; }
+
+static _Noreturn void uncaught(Value class, Value reason);
+
+static _Noreturn void raise_keeping_info(Value class, Value reason) {
+    AlkuHandler *h = handlers;
+    if (h == NULL) uncaught(class, reason);
+    handlers = h->prev;
+    caught_class = class;
+    caught_reason = reason;
+    longjmp(h->env, 1);
+}
+
+_Noreturn void alku_raise(Value class, Value reason) {
+    error_info.function = NULL;
+    error_info.has_detail = false;
+    raise_keeping_info(class, reason);
+}
+
+static _Noreturn void raise_error(Value reason) {
+    alku_raise(alku_atom("error"), reason);
+}
+
+static Value pair(const char *tag, Value v) {
+    return alku_make_tuple(2, (Value[]){alku_atom(tag), v});
+}
+
+/* catch Expr: the value an exception turns into. */
+Value alku_catch_value(Value class, Value reason) {
+    if (is_atom_named(class, "throw")) return reason;
+    if (is_atom_named(class, "exit")) return pair("EXIT", reason);
+    return pair("EXIT", alku_make_tuple(2, (Value[]){reason, alku_nil()}));
+}
+
+static _Noreturn void badarith(void) {
+    raise_error(alku_atom("badarith"));
+}
+
+static _Noreturn void overflow(void) {
+    raise_error(alku_atom("system_limit"));
+}
+
+static _Noreturn void badarg(Value v) {
+    error_info.function = NULL;
+    error_info.has_detail = true;
+    error_info.detail = v;
+    raise_keeping_info(alku_atom("error"), alku_atom("badarg"));
+}
+
+static Value array_to_list(size_t n, const Value *items) {
+    Value list = alku_nil();
+    while (n > 0) {
+        n--;
+        list = alku_cons(items[n], list);
     }
-    va_end(args);
+    return list;
+}
+
+_Noreturn void alku_error_function_clause(const char *name, int arity, const Value *args) {
+    error_info.args = array_to_list((size_t)arity, args);
+    error_info.function = name;
+    error_info.has_detail = false;
+    raise_keeping_info(alku_atom("error"), alku_atom("function_clause"));
+}
+
+static _Noreturn void badfun(Value v) {
+    raise_error(pair("badfun", v));
+}
+
+static _Noreturn void badarity(Value fun, size_t arity, const Value *args) {
+    Value inner = alku_make_tuple(2, (Value[]){fun, array_to_list(arity, args)});
+    raise_error(pair("badarity", inner));
+}
+
+_Noreturn void alku_error_badmatch(Value v) { raise_error(pair("badmatch", v)); }
+_Noreturn void alku_error_case_clause(Value v) { raise_error(pair("case_clause", v)); }
+_Noreturn void alku_error_try_clause(Value v) { raise_error(pair("try_clause", v)); }
+_Noreturn void alku_error_if_clause(void) { raise_error(alku_atom("if_clause")); }
+
+/* {Tag, X} with the given tag? Then *x is X. */
+static bool tagged(Value v, const char *tag, Value *x) {
+    if (v.tag != ALKU_TUPLE || v.as.tuple->arity != 2) return false;
+    if (!is_atom_named(v.as.tuple->elements[0], tag)) return false;
+    *x = v.as.tuple->elements[1];
+    return true;
+}
+
+/* The same wording as Erlang's shell uses for common errors. */
+static void describe_error(Buffer *b, Value reason) {
+    Value x;
+    if (is_atom_named(reason, "badarith")) {
+        buf_puts(b, "an error occurred when evaluating an arithmetic expression");
+    } else if (is_atom_named(reason, "system_limit")) {
+        buf_puts(b, "a system limit has been reached (Alku integers are 64-bit for now)");
+    } else if (is_atom_named(reason, "if_clause")) {
+        buf_puts(b, "no true branch found when evaluating an if expression");
+    } else if (is_atom_named(reason, "function_clause") && error_info.function != NULL) {
+        buf_puts(b, "no function clause matching ");
+        print_atom(b, error_info.function);
+        buf_putc(b, '(');
+        for (Value a = error_info.args; a.tag == ALKU_CONS; a = a.as.cons->tail) {
+            if (a.as.cons != error_info.args.as.cons) buf_puts(b, ", ");
+            print_value(b, a.as.cons->head, true);
+        }
+        buf_putc(b, ')');
+    } else if (is_atom_named(reason, "badarg")) {
+        buf_puts(b, "bad argument");
+        if (error_info.has_detail) {
+            buf_puts(b, ": ");
+            print_value(b, error_info.detail, true);
+        }
+    } else if (tagged(reason, "badmatch", &x)) {
+        buf_puts(b, "no match of right hand side value ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "case_clause", &x)) {
+        buf_puts(b, "no case clause matching ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "try_clause", &x)) {
+        buf_puts(b, "no try clause matching ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "badfun", &x)) {
+        buf_puts(b, "bad function ");
+        print_value(b, x, true);
+    } else if (tagged(reason, "badarity", &x) && x.tag == ALKU_TUPLE && x.as.tuple->arity == 2) {
+        int64_t n = 0;
+        for (Value a = x.as.tuple->elements[1]; a.tag == ALKU_CONS; a = a.as.cons->tail) n++;
+        print_value(b, x.as.tuple->elements[0], true);
+        buf_puts(b, " called with ");
+        buf_int(b, n);
+        buf_puts(b, n == 1 ? " argument" : " arguments");
+    } else {
+        print_value(b, reason, true);
+    }
+}
+
+static _Noreturn void uncaught(Value class, Value reason) {
+    Buffer b = {0};
+    buf_puts(&b, "** exception ");
+    buf_puts(&b, class.as.atom);
+    buf_puts(&b, ": ");
+    if (is_atom_named(class, "error")) {
+        describe_error(&b, reason);
+    } else {
+        print_value(&b, reason, true);
+    }
     buf_putc(&b, '\n');
     fflush(stdout); /* keep the program's earlier output before the error */
     buf_flush(&b, stderr);
     exit(1);
 }
 
-static _Noreturn void badarith(void) {
-    fail("an error occurred when evaluating an arithmetic expression");
-}
-
-static _Noreturn void overflow(void) {
-    fail("integer overflow (Alku integers are 64-bit for now)");
-}
-
-static _Noreturn void badarg(Value v) {
-    fail("bad argument: %v", &v);
-}
-
-_Noreturn void alku_error_function_clause(const char *name, int arity, const Value *args) {
-    Buffer b = {0};
-    buf_puts(&b, "** exception error: no function clause matching ");
-    print_atom(&b, name);
-    buf_putc(&b, '(');
-    for (int i = 0; i < arity; i++) {
-        if (i > 0) buf_puts(&b, ", ");
-        print_value(&b, args[i], true);
-    }
-    buf_puts(&b, ")\n");
-    fflush(stdout);
-    buf_flush(&b, stderr);
-    exit(1);
-}
-
-static _Noreturn void badfun(Value v) {
-    fail("bad function %v", &v);
-}
-
-static _Noreturn void badarity(Value fun, size_t arity) {
-    Buffer b = {0};
-    buf_puts(&b, "** exception error: ");
-    print_value(&b, fun, true);
-    buf_puts(&b, " called with ");
-    buf_int(&b, (int64_t)arity);
-    buf_puts(&b, arity == 1 ? " argument\n" : " arguments\n");
-    fflush(stdout);
-    buf_flush(&b, stderr);
-    exit(1);
-}
-
-_Noreturn void alku_error_badmatch(Value v) {
-    fail("no match of right hand side value %v", &v);
-}
-
-_Noreturn void alku_error_case_clause(Value v) {
-    fail("no case clause matching %v", &v);
-}
-
-_Noreturn void alku_error_if_clause(void) {
-    fail("no true branch found when evaluating an if expression");
-}
+Value alku_bif_throw(Value reason) { alku_raise(alku_atom("throw"), reason); }
+Value alku_bif_error_1(Value reason) { raise_error(reason); }
+Value alku_bif_error_2(Value reason, Value args) { (void)args; raise_error(reason); }
+Value alku_bif_exit(Value reason) { alku_raise(alku_atom("exit"), reason); }
 
 /* ---------- Constructors ---------- */
 
@@ -412,6 +524,7 @@ static int compare(Value a, Value b) {
         if (a.tag != b.tag) return a.tag < b.tag ? -1 : 1;
         switch (a.tag) {
         case ALKU_INT:
+        case ALKU_PID:
             return (a.as.integer > b.as.integer) - (a.as.integer < b.as.integer);
         case ALKU_ATOM:
             return sign(strcmp(a.as.atom, b.as.atom));
@@ -686,6 +799,64 @@ Value alku_bif_atom_to_list(Value atom) {
     return utf8_to_list((const unsigned char *)atom.as.atom, strlen(atom.as.atom));
 }
 
+/* Decimal integer with an optional sign, like Erlang's list_to_integer/1. */
+Value alku_bif_list_to_integer(Value chars) {
+    int64_t n = 0;
+    bool negative = false, digits = false;
+    Value v = chars;
+    if (v.tag == ALKU_CONS && v.as.cons->head.tag == ALKU_INT &&
+        (v.as.cons->head.as.integer == '-' || v.as.cons->head.as.integer == '+')) {
+        negative = v.as.cons->head.as.integer == '-';
+        v = v.as.cons->tail;
+    }
+    for (; v.tag == ALKU_CONS; v = v.as.cons->tail) {
+        Value c = v.as.cons->head;
+        if (c.tag != ALKU_INT || c.as.integer < '0' || c.as.integer > '9') badarg(chars);
+        int64_t d = c.as.integer - '0';
+        if (__builtin_mul_overflow(n, 10, &n) ||
+            __builtin_add_overflow(n, negative ? -d : d, &n)) {
+            overflow();
+        }
+        digits = true;
+    }
+    if (v.tag != ALKU_NIL || !digits) badarg(chars);
+    return alku_int(n);
+}
+
+/* Atoms are never freed, as in Erlang. */
+Value alku_bif_list_to_atom(Value chars) {
+    return alku_atom(c_string(chars));
+}
+
+Value alku_bif_tuple_to_list(Value tuple) {
+    if (tuple.tag != ALKU_TUPLE) badarg(tuple);
+    return array_to_list(tuple.as.tuple->arity, tuple.as.tuple->elements);
+}
+
+Value alku_bif_list_to_tuple(Value list) {
+    size_t n = proper_length(list);
+    Value tuple = alku_make_tuple(n, NULL);
+    size_t i = 0;
+    for (Value v = list; v.tag == ALKU_CONS; v = v.as.cons->tail) {
+        tuple.as.tuple->elements[i++] = v.as.cons->head;
+    }
+    return tuple;
+}
+
+/* If the terms are equal, the first one is returned, as in Erlang. */
+Value alku_bif_max(Value a, Value b) { return compare(a, b) >= 0 ? a : b; }
+Value alku_bif_min(Value a, Value b) { return compare(a, b) <= 0 ? a : b; }
+
+Value alku_bif_apply_2(Value fun, Value args) {
+    size_t n = proper_length(args);
+    Value array = alku_make_tuple(n, NULL); /* a tuple keeps the values visible to the GC */
+    size_t i = 0;
+    for (Value v = args; v.tag == ALKU_CONS; v = v.as.cons->tail) {
+        array.as.tuple->elements[i++] = v.as.cons->head;
+    }
+    return alku_settle(alku_apply(fun, n, array.as.tuple->elements));
+}
+
 Value alku_lists_reverse_2(Value list, Value tail) {
     Value result = tail;
     Value v = list;
@@ -698,19 +869,55 @@ Value alku_lists_reverse_1(Value list) {
     return alku_lists_reverse_2(list, alku_nil());
 }
 
+/* ---------- Devices ---------- */
+
+/* Open files are numbered and shown as pids, like Erlang's file:open/2
+ * returns. standard_io / user / standard_error are atoms. */
+#define MAX_FILES 256
+static FILE *files[MAX_FILES];
+
+static Value device_value(int64_t index) {
+    Value v;
+    v.tag = ALKU_PID;
+    v.as.integer = index;
+    return v;
+}
+
+static FILE *output_device(Value dev) {
+    if (is_atom_named(dev, "standard_io") || is_atom_named(dev, "user")) return stdout;
+    if (is_atom_named(dev, "standard_error")) return stderr;
+    if (dev.tag == ALKU_PID && dev.as.integer >= 0 && dev.as.integer < MAX_FILES &&
+        files[dev.as.integer] != NULL) {
+        return files[dev.as.integer];
+    }
+    badarg(dev);
+}
+
+static FILE *input_device(Value dev) {
+    if (is_atom_named(dev, "standard_io") || is_atom_named(dev, "user")) return stdin;
+    return output_device(dev);
+}
+
+/* The Erlang name for an errno value, as in {error, enoent}. */
+static Value errno_atom(int e) {
+    switch (e) {
+    case ENOENT: return alku_atom("enoent");
+    case EACCES: return alku_atom("eacces");
+    case EISDIR: return alku_atom("eisdir");
+    case ENOTDIR: return alku_atom("enotdir");
+    case EEXIST: return alku_atom("eexist");
+    case ENOSPC: return alku_atom("enospc");
+    case EROFS: return alku_atom("erofs");
+    case EMFILE: return alku_atom("emfile");
+    default: return alku_atom("eio");
+    }
+}
+
+static Value error_tuple(int e) {
+    return pair("error", errno_atom(e));
+}
+
 /* ---------- io ---------- */
-
-Value alku_io_write(Value v) {
-    Buffer b = {0};
-    print_value(&b, v, false);
-    buf_flush(&b, stdout);
-    return alku_atom("ok");
-}
-
-Value alku_io_nl(void) {
-    putchar('\n');
-    return alku_atom("ok");
-}
 
 /* ~s accepts an atom or a (possibly nested) list of character codes. */
 static void print_chars(Buffer *b, Value v, Value arg) {
@@ -731,6 +938,14 @@ static void print_chars(Buffer *b, Value v, Value arg) {
     if (v.tag != ALKU_NIL) badarg(arg);
 }
 
+/* A NUL-terminated UTF-8 copy of a string (for file names). Free it. */
+static char *c_string(Value chars) {
+    Buffer b = {0};
+    print_chars(&b, chars, chars);
+    buf_putc(&b, '\0');
+    return b.data;
+}
+
 static Value next_arg(Value *args, Value all) {
     if (args->tag != ALKU_CONS) badarg(all);
     Value arg = args->as.cons->head;
@@ -739,41 +954,40 @@ static Value next_arg(Value *args, Value all) {
 }
 
 /* Supports ~w ~p ~s ~c ~b ~B ~n ~~ (no field widths yet). */
-Value alku_io_format_2(Value format, Value args) {
-    Buffer b = {0};
+static void format(Buffer *b, Value format, Value args) {
     Value f = format, rest = args;
     while (f.tag == ALKU_CONS) {
         Value c = f.as.cons->head;
         f = f.as.cons->tail;
         if (c.tag != ALKU_INT || !is_char_code(c.as.integer)) badarg(format);
         if (c.as.integer != '~') {
-            buf_utf8(&b, c.as.integer);
+            buf_utf8(b, c.as.integer);
             continue;
         }
         if (f.tag != ALKU_CONS || f.as.cons->head.tag != ALKU_INT) badarg(format);
         int64_t control = f.as.cons->head.as.integer;
         f = f.as.cons->tail;
         switch (control) {
-        case 'n': buf_putc(&b, '\n'); break;
-        case '~': buf_putc(&b, '~'); break;
-        case 'w': print_value(&b, next_arg(&rest, args), false); break;
-        case 'p': print_value(&b, next_arg(&rest, args), true); break;
+        case 'n': buf_putc(b, '\n'); break;
+        case '~': buf_putc(b, '~'); break;
+        case 'w': print_value(b, next_arg(&rest, args), false); break;
+        case 'p': print_value(b, next_arg(&rest, args), true); break;
         case 's': {
             Value arg = next_arg(&rest, args);
-            print_chars(&b, arg, arg);
+            print_chars(b, arg, arg);
             break;
         }
         case 'c': {
             Value arg = next_arg(&rest, args);
             if (arg.tag != ALKU_INT || !is_char_code(arg.as.integer)) badarg(arg);
-            buf_utf8(&b, arg.as.integer);
+            buf_utf8(b, arg.as.integer);
             break;
         }
         case 'b':
         case 'B': {
             Value arg = next_arg(&rest, args);
             if (arg.tag != ALKU_INT) badarg(arg);
-            buf_int(&b, arg.as.integer);
+            buf_int(b, arg.as.integer);
             break;
         }
         default:
@@ -781,12 +995,150 @@ Value alku_io_format_2(Value format, Value args) {
         }
     }
     if (f.tag != ALKU_NIL || rest.tag != ALKU_NIL) badarg(args);
-    buf_flush(&b, stdout);
+}
+
+/* Output is formatted completely before anything is written, so a failing
+ * call prints nothing, as in Erlang. */
+static Value write_buffer(Buffer *b, Value dev) {
+    FILE *out = output_device(dev);
+    buf_flush(b, out);
     return alku_atom("ok");
 }
 
-Value alku_io_format_1(Value format) {
-    return alku_io_format_2(format, alku_nil());
+Value alku_io_format_3(Value dev, Value fmt, Value args) {
+    Buffer b = {0};
+    format(&b, fmt, args);
+    return write_buffer(&b, dev);
+}
+
+Value alku_io_format_2(Value fmt, Value args) {
+    return alku_io_format_3(alku_atom("standard_io"), fmt, args);
+}
+
+Value alku_io_format_1(Value fmt) {
+    return alku_io_format_3(alku_atom("standard_io"), fmt, alku_nil());
+}
+
+Value alku_io_write_2(Value dev, Value v) {
+    Buffer b = {0};
+    print_value(&b, v, false);
+    return write_buffer(&b, dev);
+}
+
+Value alku_io_write(Value v) {
+    return alku_io_write_2(alku_atom("standard_io"), v);
+}
+
+Value alku_io_put_chars_2(Value dev, Value chars) {
+    Buffer b = {0};
+    print_chars(&b, chars, chars);
+    return write_buffer(&b, dev);
+}
+
+Value alku_io_put_chars_1(Value chars) {
+    return alku_io_put_chars_2(alku_atom("standard_io"), chars);
+}
+
+Value alku_io_nl_1(Value dev) {
+    return alku_io_put_chars_2(dev, alku_string("\n", 1));
+}
+
+Value alku_io_nl(void) {
+    return alku_io_nl_1(alku_atom("standard_io"));
+}
+
+/* io:get_line: the next line including its "\n", or eof. */
+Value alku_io_get_line_2(Value dev, Value prompt) {
+    FILE *in = input_device(dev);
+    if (in == stdin) {
+        Buffer p = {0};
+        print_chars(&p, prompt, prompt);
+        buf_flush(&p, stdout);
+        fflush(stdout);
+    }
+    Buffer line = {0};
+    int c;
+    while ((c = getc(in)) != EOF) {
+        buf_putc(&line, (char)c);
+        if (c == '\n') break;
+    }
+    if (line.length == 0) {
+        free(line.data);
+        return ferror(in) ? error_tuple(errno) : alku_atom("eof");
+    }
+    Value result = utf8_to_list((const unsigned char *)line.data, line.length);
+    free(line.data);
+    return result;
+}
+
+Value alku_io_get_line_1(Value prompt) {
+    return alku_io_get_line_2(alku_atom("standard_io"), prompt);
+}
+
+/* ---------- file ---------- */
+
+/* file:open(Name, Modes) with modes read, write and append. */
+Value alku_file_open(Value name, Value modes) {
+    bool read = false, write = false, append = false;
+    Value m = modes;
+    for (; m.tag == ALKU_CONS; m = m.as.cons->tail) {
+        Value mode = m.as.cons->head;
+        if (is_atom_named(mode, "read")) read = true;
+        else if (is_atom_named(mode, "write")) write = true;
+        else if (is_atom_named(mode, "append")) append = true;
+        else badarg(mode); /* binary mode and others are not supported yet */
+    }
+    if (m.tag != ALKU_NIL) badarg(modes);
+    const char *how = append ? (read ? "a+" : "a") : write ? (read ? "w+" : "w") : "r";
+    int64_t slot = 0;
+    while (slot < MAX_FILES && files[slot] != NULL) slot++;
+    if (slot == MAX_FILES) return error_tuple(EMFILE);
+    char *path = c_string(name);
+    FILE *f = fopen(path, how);
+    int e = errno;
+    free(path);
+    if (f == NULL) return error_tuple(e);
+    files[slot] = f;
+    return pair("ok", device_value(slot));
+}
+
+Value alku_file_close(Value dev) {
+    if (dev.tag != ALKU_PID || dev.as.integer < 0 || dev.as.integer >= MAX_FILES ||
+        files[dev.as.integer] == NULL) {
+        badarg(dev);
+    }
+    fclose(files[dev.as.integer]);
+    files[dev.as.integer] = NULL;
+    return alku_atom("ok");
+}
+
+Value alku_file_write_file(Value name, Value data) {
+    Buffer b = {0};
+    print_chars(&b, data, data);
+    char *path = c_string(name);
+    FILE *f = fopen(path, "w");
+    int e = errno;
+    free(path);
+    if (f == NULL) {
+        free(b.data);
+        return error_tuple(e);
+    }
+    if (b.length > 0) fwrite(b.data, 1, b.length, f);
+    free(b.data);
+    bool failed = fclose(f) != 0;
+    return failed ? error_tuple(errno) : alku_atom("ok");
+}
+
+/* ---------- halt ---------- */
+
+Value alku_bif_halt_1(Value status) {
+    if (status.tag != ALKU_INT || status.as.integer < 0 || status.as.integer > 255) badarg(status);
+    fflush(stdout);
+    exit((int)status.as.integer);
+}
+
+Value alku_bif_halt_0(void) {
+    return alku_bif_halt_1(alku_int(0));
 }
 
 /* ---------- Calls, tail calls and program start ---------- */
@@ -818,19 +1170,19 @@ Value alku_run_pending(void) {
     return pending.code(pending.args, pending.self);
 }
 
-static AlkuFun *checked_fun(Value fun, size_t arity) {
+static AlkuFun *checked_fun(Value fun, size_t arity, const Value *args) {
     if (fun.tag != ALKU_FUN) badfun(fun);
-    if (fun.as.fun->arity != arity) badarity(fun, arity);
+    if (fun.as.fun->arity != arity) badarity(fun, arity, args);
     return fun.as.fun;
 }
 
 Value alku_apply(Value fun, size_t arity, const Value *args) {
-    AlkuFun *f = checked_fun(fun, arity);
+    AlkuFun *f = checked_fun(fun, arity, args);
     return f->code(args, f);
 }
 
 Value alku_tail_apply(Value fun, size_t arity, const Value *args) {
-    AlkuFun *f = checked_fun(fun, arity);
+    AlkuFun *f = checked_fun(fun, arity, args);
     return alku_tail_call(f->code, f, arity, args);
 }
 
@@ -839,20 +1191,44 @@ Value alku_tail_apply(Value fun, size_t arity, const Value *args) {
  * take memory. */
 #define STACK_SIZE ((size_t)512 * 1024 * 1024)
 
-static void *run_main(void *main) {
+static struct {
+    AlkuCode main;
+    int arity; /* main/0 or main/1 */
+    int argc;
+    char **argv;
+} program;
+
+static void *run_main(void *unused) {
+    (void)unused;
     gc_init(__builtin_frame_address(0));
     gc_add_root(&pending, sizeof pending);
-    (void)alku_settle(((AlkuCode)(uintptr_t)main)(NULL, NULL));
+    gc_add_root(&caught_class, sizeof caught_class);
+    gc_add_root(&caught_reason, sizeof caught_reason);
+    gc_add_root(&error_info, sizeof error_info);
+    if (program.arity == 1) { /* main(Args): the command-line arguments as strings */
+        ListBuilder lb = list_builder();
+        for (int i = 1; i < program.argc; i++) {
+            list_push(&lb, alku_string(program.argv[i], strlen(program.argv[i])));
+        }
+        Value args = list_finish(&lb, alku_nil());
+        (void)alku_settle(program.main(&args, NULL));
+    } else {
+        (void)alku_settle(program.main(NULL, NULL));
+    }
     fflush(stdout);
     return NULL;
 }
 
-int alku_start(AlkuCode main) {
+int alku_start(AlkuCode main, int arity, int argc, char **argv) {
+    program.main = main;
+    program.arity = arity;
+    program.argc = argc;
+    program.argv = argv;
     pthread_attr_t attr;
     pthread_t thread;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, STACK_SIZE);
-    if (pthread_create(&thread, &attr, run_main, (void *)(uintptr_t)main) != 0) {
+    if (pthread_create(&thread, &attr, run_main, NULL) != 0) {
         fputs("** could not start the program thread\n", stderr);
         return 1;
     }

@@ -33,7 +33,7 @@ rebar3 escriptize                 # builds _build/default/bin/alku
 rebar3 eunit                      # runs all tests
 rebar3 check                      # tests + dialyzer type checks
 
-alku run FILE.erl                 # compile and run
+alku run FILE.erl [ARGS...]       # compile and run
 alku build FILE.erl [-o OUT]      # build an executable (default: FILE)
 alku c FILE.erl                   # show the generated C code
 ```
@@ -42,14 +42,21 @@ alku c FILE.erl                   # show the generated C code
 you can put it on your PATH, e.g.
 `ln -s "$PWD/_build/default/bin/alku" ~/.local/bin/alku`.
 
-## What works now (phase 3)
+## What works now (phase 4)
 
 - Integers (64-bit; overflow is a runtime error), atoms, tuples, lists,
   strings (lists of character codes, as in Erlang) and funs
 - Functions with multiple clauses, pattern matching and guards (`,` and `;`)
 - Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`, `P1 = P2`,
   repeated variables
-- `case`, `if`, `begin ... end`, `=` matches
+- `case`, `if`, `begin ... end`, `=` matches; variables bound in every
+  clause of a `case`/`if` can be used after it
+- Exceptions: `try ... of ... catch ... after ... end`, `catch Expr`,
+  `throw/1`, `error/1,2`, `exit/1`. Runtime errors are raised with
+  Erlang's reasons (`badarith`, `{badmatch, V}`, `function_clause`, ...),
+  and a guard that raises is simply false, as in Erlang
+- List comprehensions: `[X * 2 || X <- L, X > 0]`, several generators,
+  patterns in generators
 - Funs: `fun(X) -> ... end` with captured variables, named funs
   (`fun Loop(N) -> ... Loop(N - 1) end`), `fun f/1`, `fun lists:map/2`,
   `fun erlang:abs/1`
@@ -63,9 +70,18 @@ you can put it on your PATH, e.g.
 - Built-ins: `is_integer/1`, `is_atom/1`, `is_boolean/1`, `is_list/1`,
   `is_tuple/1`, `is_function/1,2`, `abs/1`, `hd/1`, `tl/1`, `length/1`,
   `element/2`, `setelement/3`, `tuple_size/1`, `integer_to_list/1`,
-  `atom_to_list/1`, `io:write/1`, `io:nl/0`, `io:format/1,2`
+  `atom_to_list/1`, `list_to_integer/1`, `list_to_atom/1`,
+  `tuple_to_list/1`, `list_to_tuple/1`, `max/2`, `min/2`, `apply/2`,
+  `halt/0,1`
+- Programs: `main/1` receives the command-line arguments as strings
+  (`main/0` also works)
+- I/O: `io:format/1,2,3`, `io:put_chars/1,2`, `io:write/1,2`,
+  `io:nl/0,1`, `io:get_line/1,2`, `file:open/2` (read, write, append),
+  `file:close/1`, `file:write_file/2`
 - Standard library `lists`: `all any append duplicate filter flatten foldl
   foldr foreach last map max member min nth reverse seq sort sum zip`
+- Standard library `string`: `is_empty join lowercase split tokens
+  to_lower to_upper trim uppercase`
 - `io:format` controls: `~w ~p ~s ~c ~b ~B ~n ~~` (no field widths)
 - Erlang-style runtime errors (`no function clause matching f(5)`, ...)
 - Compile errors and warnings from Erlang's own linter
@@ -74,9 +90,9 @@ Programs that use only these features are also valid Erlang and print
 the same output under `erl`. One difference: `~p` never breaks long
 terms over several lines.
 
-Not yet: floats, maps, binaries, big integers, exceptions (`try`),
-list comprehensions, `"abc" ++ Rest` patterns, using a variable after
-the `case` that bound it, programs made of several modules.
+Not yet: floats, maps, binaries (so no `file:read_file/1`), records,
+big integers, stack traces, `"abc" ++ Rest` patterns, programs made of
+several modules.
 
 ## How the runtime works
 
@@ -87,6 +103,8 @@ the `case` that bound it, programs made of several modules.
   becomes a `goto` back to its start. Any other tail call returns a
   "pending call" to the nearest non-tail call site, which runs it
   (a trampoline), so the C stack never grows.
+- **Exceptions** use `setjmp`/`longjmp`: `try` pushes a handler on the C
+  stack and raising jumps to the innermost one.
 - **Garbage collector** (`alku_gc.c`): mark-and-sweep. Roots are found by
   scanning the C stack conservatively; heap objects are traced precisely.
   Set `ALKU_GC_STRESS=1` to collect very often, which the tests do to
@@ -113,7 +131,9 @@ the `case` that bound it, programs made of several modules.
 ## Tests
 
 `rebar3 eunit` runs the unit tests and every program in `examples/`,
-once normally and once with `ALKU_GC_STRESS=1`.
+once normally and once with `ALKU_GC_STRESS=1`. A program can also
+have `NAME.input` (given as stdin) and `NAME.args` (command-line
+arguments, one per line).
 Each `NAME.erl` there has a `NAME.expected` file with exactly what the
 program should print (or the compile errors it should produce). To add a
 test, add a new pair of files.

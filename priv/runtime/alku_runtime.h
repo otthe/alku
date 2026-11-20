@@ -15,16 +15,18 @@
 #ifndef ALKU_RUNTIME_H
 #define ALKU_RUNTIME_H
 
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 /* Tags are declared in Erlang term order:
- * number < atom < fun < tuple < nil < list. */
+ * number < atom < fun < pid < tuple < nil < list. */
 typedef enum {
     ALKU_INT,
     ALKU_ATOM,
     ALKU_FUN,
+    ALKU_PID, /* an open file, like the pids Erlang uses for files */
     ALKU_TUPLE,
     ALKU_NIL,
     ALKU_CONS,
@@ -68,9 +70,24 @@ struct AlkuFun {
     Value env[];
 };
 
-/* Program entry: runs main (an Alku function of arity 0) and returns the
- * process exit status. */
-int alku_start(AlkuCode main);
+/* Program entry: runs main/0 or main/1 (which gets the command-line
+ * arguments) and returns the process exit status. */
+int alku_start(AlkuCode main, int arity, int argc, char **argv);
+
+/* Exceptions. try pushes a handler, then calls setjmp(handler.env):
+ * raising an exception jumps there with the class (error, throw or exit)
+ * and reason available from alku_caught_class/alku_caught_reason. */
+typedef struct AlkuHandler {
+    jmp_buf env;
+    struct AlkuHandler *prev;
+} AlkuHandler;
+
+void alku_try(AlkuHandler *h);
+void alku_end_try(AlkuHandler *h);
+_Noreturn void alku_raise(Value class, Value reason);
+Value alku_caught_class(void);
+Value alku_caught_reason(void);
+Value alku_catch_value(Value class, Value reason);
 
 /* Calls and tail calls */
 Value alku_apply(Value fun, size_t arity, const Value *args);
@@ -152,17 +169,43 @@ Value alku_bif_setelement(Value n, Value tuple, Value v);
 Value alku_bif_tuple_size(Value tuple);
 Value alku_bif_integer_to_list(Value n);
 Value alku_bif_atom_to_list(Value atom);
+Value alku_bif_list_to_integer(Value chars);
+Value alku_bif_list_to_atom(Value chars);
+Value alku_bif_tuple_to_list(Value tuple);
+Value alku_bif_list_to_tuple(Value list);
+Value alku_bif_max(Value a, Value b);
+Value alku_bif_min(Value a, Value b);
+Value alku_bif_apply_2(Value fun, Value args);
+Value alku_bif_throw(Value reason);
+Value alku_bif_error_1(Value reason);
+Value alku_bif_error_2(Value reason, Value args);
+Value alku_bif_exit(Value reason);
+Value alku_bif_halt_0(void);
+Value alku_bif_halt_1(Value status);
 Value alku_lists_reverse_1(Value list);
 Value alku_lists_reverse_2(Value list, Value tail);
+
+/* io and file. Devices are standard_io, standard_error or an open file. */
 Value alku_io_write(Value v);
+Value alku_io_write_2(Value dev, Value v);
 Value alku_io_nl(void);
+Value alku_io_nl_1(Value dev);
 Value alku_io_format_1(Value format);
 Value alku_io_format_2(Value format, Value args);
+Value alku_io_format_3(Value dev, Value format, Value args);
+Value alku_io_put_chars_1(Value chars);
+Value alku_io_put_chars_2(Value dev, Value chars);
+Value alku_io_get_line_1(Value prompt);
+Value alku_io_get_line_2(Value dev, Value prompt);
+Value alku_file_open(Value name, Value modes);
+Value alku_file_close(Value dev);
+Value alku_file_write_file(Value name, Value data);
 
-/* Runtime errors: print an Erlang-style message and exit with status 1. */
+/* Runtime errors: raise the same error Erlang would. */
 _Noreturn void alku_error_function_clause(const char *name, int arity, const Value *args);
 _Noreturn void alku_error_badmatch(Value v);
 _Noreturn void alku_error_case_clause(Value v);
 _Noreturn void alku_error_if_clause(void);
+_Noreturn void alku_error_try_clause(Value v);
 
 #endif

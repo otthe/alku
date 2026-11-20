@@ -2,6 +2,8 @@
 %% prints (or the compile errors) with the matching .expected file.
 %%
 %% To add a test, drop NAME.erl and NAME.expected into examples/.
+%% Optional: NAME.input is given to the program as stdin, and NAME.args
+%% holds its command-line arguments, one per line.
 %% Paths are relative to the project root, where rebar3 eunit runs.
 -module(alku_examples_tests).
 
@@ -20,14 +22,31 @@ check(Src) ->
     Exe = alku_os:temp_file("alku_test"),
     case alku_compiler:build(Src, Exe) of
         {ok, Warnings} ->
-            {_, Normal} = alku_os:run(Exe, []),
-            {_, Stressed} = alku_os:run(Exe, [], [{"ALKU_GC_STRESS", "1"}]),
+            Normal = run(Exe, Src, []),
+            Stressed = run(Exe, Src, [{"ALKU_GC_STRESS", "1"}]),
             ok = file:delete(Exe),
             ?assertEqual(Expected, output(Warnings, Normal)),
             ?assertEqual(Expected, output(Warnings, Stressed));
         {error, Errors} ->
             ?assertEqual(Expected, output(Errors, <<>>))
     end.
+
+%% Runs the program through sh, to give it NAME.input (or nothing) as stdin.
+run(Exe, Src, Env) ->
+    Base = filename:rootname(Src),
+    Input = case filelib:is_regular(Base ++ ".input") of
+                true -> Base ++ ".input";
+                false -> "/dev/null"
+            end,
+    Args = case file:read_file(Base ++ ".args") of
+               {ok, Text} -> string:lexemes(binary_to_list(Text), "\n");
+               {error, _} -> []
+           end,
+    Sh = os:find_executable("sh"),
+    Script = "exec \"$0\" \"$@\" < \"$ALKU_TEST_INPUT\"",
+    {_Status, Output} = alku_os:run(Sh, ["-c", Script, Exe | Args],
+                                    [{"ALKU_TEST_INPUT", Input} | Env]),
+    Output.
 
 %% Everything a user would see: compiler messages, then program output.
 output(Messages, ProgramOutput) ->

@@ -1,0 +1,7 @@
+args: ["1","2","39"]
+sum: 42
+name? 
+hello World
+["first line","second line"]
+opening a missing file gives {error,enoent}
+bye

@@ -9,8 +9,11 @@
 %%   pattern or guard jumps to the label in front of the next clause.
 %% - The last expression of a body is compiled with a continuation that
 %%   says where its value goes: `tail` (return it from the C function) or
-%%   {assign, Var, Label} (store it and jump to Label, used for a case or
-%%   if whose value is needed).
+%%   {assign, Var, Label, Exports} (store it and jump to Label, used for a
+%%   case, if or try whose value is needed; Exports are the variables bound
+%%   in every clause, which stay usable after it, as in Erlang).
+%% - Exceptions use setjmp/longjmp: try pushes a handler and raising jumps
+%%   to the innermost one (see AlkuHandler in alku_runtime.h).
 %%
 %% Tail calls: in `tail` position, a call to the function being compiled
 %% becomes a jump back to its start, and any other call to an Alku
@@ -41,8 +44,12 @@ program([{Main, _} | _] = Modules) ->
                            || {M, Forms} <- Modules,
                               {function, _, Name, Arity, _} <- Forms]),
     try
-        maps:is_key({Main, main, 0}, Funs) orelse
-            throw({alku_error, Main, 1, "a program needs a main/0 function"}),
+        MainArity = case Funs of
+                        #{{Main, main, 1} := _} -> 1;
+                        #{{Main, main, 0} := _} -> 0;
+                        _ -> throw({alku_error, Main, 1,
+                                    "a program needs a main/0 or main/1 function"})
+                    end,
         Compiled = lists:append([compile_function(M, F, Funs)
                                  || {M, Forms} <- Modules,
                                     {function, _, _, _, _} = F <- Forms]),
@@ -52,8 +59,9 @@ program([{Main, _} | _] = Modules) ->
                 "#include \"alku_runtime.h\"\n\n",
                 Prototypes, "\n",
                 Definitions,
-                "int main(void) {\n",
-                "return alku_start(", alku_c:function_name(Main, main, 0), ");\n",
+                "int main(int argc, char **argv) {\n",
+                "return alku_start(", alku_c:function_name(Main, main, MainArity), ", ",
+                integer_to_list(MainArity), ", argc, argv);\n",
                 "}\n"],
         {ok, alku_c:indent(Code)}
     catch
@@ -174,19 +182,68 @@ string_to_list_pattern([C | Cs], Anno) ->
 guard([], _Fail, St) ->
     {[], St};
 guard([Tests], Fail, St) ->
-    guard_tests(Tests, Fail, St);
+    guard_alternative(Tests, Fail, St);
 guard(Alternatives, Fail, St0) ->
     {Ok, St1} = fresh("guard_ok", St0),
     guard_alternatives(Alternatives, Ok, Fail, St1).
 
 guard_alternatives([Tests], Ok, Fail, St0) ->
-    {Code, St1} = guard_tests(Tests, Fail, St0),
+    {Code, St1} = guard_alternative(Tests, Fail, St0),
     {["{\n", Code, "}\n", Ok, ": ;\n"], St1};
 guard_alternatives([Tests | Rest], Ok, Fail, St0) ->
     {Next, St1} = fresh("guard_alt", St0),
-    {Code, St2} = guard_tests(Tests, ["goto ", Next, ";"], St1),
+    {Code, St2} = guard_alternative(Tests, ["goto ", Next, ";"], St1),
     {RestCode, St3} = guard_alternatives(Rest, Ok, Fail, St2),
     {["{\n", Code, "goto ", Ok, ";\n}\n", Next, ": ;\n", RestCode], St3}.
+
+%% In Erlang an exception in a guard just makes it false. Guards that
+%% cannot raise (comparisons and type tests on variables, the usual case)
+%% are compiled as they are; others run under an exception handler.
+guard_alternative(Tests, Fail, St0) ->
+    case lists:all(fun safe_guard/1, Tests) of
+        true ->
+            guard_tests(Tests, Fail, St0);
+        false ->
+            {H, St1} = fresh("guard_handler", St0),
+            {Code, St2} = guard_tests(Tests, ["{ alku_end_try(&", H, "); ", Fail, " }"], St1),
+            {["{\n",
+              "AlkuHandler ", H, ";\n",
+              "alku_try(&", H, ");\n",
+              "if (setjmp(", H, ".env) != 0) ", Fail, "\n",
+              Code,
+              "alku_end_try(&", H, ");\n",
+              "}\n"], St2}
+    end.
+
+safe_guard({var, _, _}) -> true;
+safe_guard(E) -> literal(E) =/= error orelse boolean_safe(E).
+
+%% Boolean-valued guard expressions that can never raise.
+boolean_safe({atom, _, B}) -> B =:= true orelse B =:= false;
+boolean_safe({op, _, Op, A, B}) when Op =:= 'andalso'; Op =:= 'orelse';
+                                     Op =:= 'and'; Op =:= 'or'; Op =:= 'xor' ->
+    boolean_safe(A) andalso boolean_safe(B);
+boolean_safe({op, _, 'not', A}) ->
+    boolean_safe(A);
+boolean_safe({op, _, Op, A, B}) ->
+    lists:member(Op, ['==', '/=', '=:=', '=/=', '<', '>', '=<', '>=']) andalso
+        total(A) andalso total(B);
+boolean_safe({call, _, {atom, _, F}, [A]}) ->
+    type_test(F) andalso total(A);
+boolean_safe({call, _, {remote, _, {atom, _, erlang}, {atom, _, F}}, [A]}) ->
+    type_test(F) andalso total(A);
+boolean_safe(_) ->
+    false.
+
+type_test(F) ->
+    lists:member(F, [is_integer, is_atom, is_boolean, is_list, is_tuple, is_function]).
+
+%% Expressions whose evaluation cannot raise.
+total({var, _, _}) -> true;
+total({tuple, _, Es}) -> lists:all(fun total/1, Es);
+total({cons, _, H, T}) -> total(H) andalso total(T);
+total({string, _, _}) -> true;
+total(E) -> literal(E) =/= error.
 
 guard_tests([], _Fail, St) ->
     {[], St};
@@ -230,28 +287,127 @@ expr_k({op, _, Op, A, B}, K, St0) when Op =:= 'andalso'; Op =:= 'orelse' ->
     Code = [CodeA, CodeT,
             "alku_check_boolean(", T, ");\n",
             "if (", Test, ") {\n", CodeB, "}\n",
-            continue(K, T)],
+            continue(K, T, St2)],
     {Code, St3#st{vars = St2#st.vars}};
 expr_k({call, Anno, Callee, Args}, tail, St0) ->
     {ArgCode, Refs, St1} = exprs(Args, St0),
     {CalleeCode, Target, St2} = callee(Callee, length(Args), Anno, St1),
     {[ArgCode, CalleeCode, tail_call(Target, Refs, St2)], St2};
+expr_k({'try', _, Body, OfClauses, CatchClauses, []}, K, St0) ->
+    %% try Body of OfClauses catch CatchClauses end
+    {H, St1} = fresh("handler", St0),
+    {BodyCode, BodyRef, St2} = sequence(Body, St1),
+    {Normal, St3} =
+        case OfClauses of
+            [] -> {continue(K, BodyRef, St2), St2};
+            _ -> clauses(OfClauses, [BodyRef], K,
+                         ["alku_error_try_clause(", BodyRef, ");\n"], St2)
+        end,
+    {Caught, St4} = catch_clauses(CatchClauses, K, St3#st{vars = St1#st.vars}),
+    Code = ["AlkuHandler ", H, ";\n",
+            "alku_try(&", H, ");\n",
+            "if (setjmp(", H, ".env) == 0) {\n",
+            BodyCode,
+            "alku_end_try(&", H, ");\n",
+            Normal, % ends with return, goto or a raise
+            "}\n",
+            Caught],
+    {Code, St4#st{vars = St1#st.vars}};
+expr_k({'try', Anno, Body, OfClauses, CatchClauses, After}, K, St0) ->
+    %% ... after After end: run After whether or not an exception happened
+    Inner = case {OfClauses, CatchClauses} of
+                {[], []} -> {block, Anno, Body};
+                _ -> {'try', Anno, Body, OfClauses, CatchClauses, []}
+            end,
+    {H, St1} = fresh("handler", St0),
+    {R, St2} = fresh("r", St1),
+    {InnerCode, InnerRef, St3} = expr(Inner, St2),
+    {AfterOk, _, St4} = sequence(After, St3#st{vars = St2#st.vars}),
+    {AfterError, _, St5} = sequence(After, St4#st{vars = St2#st.vars}),
+    Code = ["AlkuHandler ", H, ";\n",
+            "Value ", R, ";\n",
+            "alku_try(&", H, ");\n",
+            "if (setjmp(", H, ".env) == 0) {\n",
+            InnerCode,
+            R, " = ", InnerRef, ";\n",
+            "alku_end_try(&", H, ");\n",
+            "} else {\n",
+            AfterError,
+            "alku_raise(alku_caught_class(), alku_caught_reason());\n",
+            "}\n",
+            AfterOk],
+    St6 = St5#st{vars = St2#st.vars},
+    {[Code, continue(K, R, St6)], St6};
 expr_k(E, K, St0) ->
     {Code, Ref, St1} = expr(E, St0),
-    {[Code, continue(K, Ref)], St1}.
+    {[Code, continue(K, Ref, St1)], St1}.
 
-continue(tail, Ref) ->
+%% The catch part of a try, run after an exception has jumped back here.
+%% Each clause looks like Class:Reason:Stacktrace (the stacktrace is []).
+catch_clauses(Clauses0, K, St0) ->
+    {Class, St1} = fresh("class", St0),
+    {Reason, St2} = fresh("reason", St1),
+    Clauses = [{clause, A, [C, R], G, [{match, A, S, {nil, A}} | B]}
+               || {clause, A, [{tuple, _, [C, R, S]}], G, B} <- Clauses0],
+    Reraise = ["alku_raise(", Class, ", ", Reason, ");\n"],
+    {Code, St3} = clauses(Clauses, [Class, Reason], K, Reraise, St2),
+    {["{\n",
+      "Value ", Class, " = alku_caught_class();\n",
+      "Value ", Reason, " = alku_caught_reason();\n",
+      Code,
+      "}\n"], St3}.
+
+continue(tail, Ref, _St) ->
     ["return ", Ref, ";\n"];
-continue({assign, Var, Label}, Ref) ->
-    [Var, " = ", Ref, ";\ngoto ", Label, ";\n"].
+continue({assign, Var, Label, Exports}, Ref, St) ->
+    %% copy exported variables bound on this path into their shared C variables
+    [[[CVar, " = ", Bound, ";\n"] || {Name, CVar} <- Exports,
+                                     {ok, Bound} <- [maps:find(Name, St#st.vars)],
+                                     Bound =/= CVar],
+     Var, " = ", Ref, ";\ngoto ", Label, ";\n"].
 
-%% case, if, andalso and orelse in value position: the branches store the
-%% result in one C variable and jump to the end.
+%% case, if, try, andalso and orelse in value position: the branches store
+%% the result in one C variable and jump to the end.
 via_continuation(E, St0) ->
     {Result, St1} = fresh("r", St0),
     {End, St2} = fresh("end", St1),
-    {Code, St3} = expr_k(E, {assign, Result, End}, St2),
-    {["Value ", Result, ";\n", Code, End, ": ;\n"], Result, St3#st{vars = St2#st.vars}}.
+    {Decls, Exports, St3} = exports(E, St2),
+    {Code, St4} = expr_k(E, {assign, Result, End, Exports}, St3),
+    Vars = maps:merge(St2#st.vars, maps:from_list(Exports)),
+    {["Value ", Result, ";\n", Decls, Code, End, ": ;\n"], Result, St4#st{vars = Vars}}.
+
+%% Variables that every clause of a case or if binds can be used after it.
+%% erl_lint rejects uses of variables bound in only some clauses, so
+%% variables new in every clause are enough to look at.
+exports(E, St0) ->
+    Clauses = case E of
+                  {'case', _, _, Cs} -> Cs;
+                  {'if', _, Cs} -> Cs;
+                  _ -> []
+              end,
+    New = [[V || V <- lists:usort(vars_outside_funs(C)), not maps:is_key(V, St0#st.vars)]
+           || C <- Clauses],
+    Names = case New of
+                [] -> [];
+                [First | Rest] ->
+                    lists:foldl(fun(Vs, Acc) -> [V || V <- Acc, lists:member(V, Vs)] end,
+                                First, Rest)
+            end,
+    lists:foldr(fun(Name, {Decls, Exports, St}) ->
+                        {N, St1} = next(St),
+                        CVar = alku_c:var_name(Name, N),
+                        {[["Value ", CVar, ";\n"] | Decls], [{Name, CVar} | Exports], St1}
+                end, {[], [], St0}, Names).
+
+%% Variables in an expression, except those local to funs and list
+%% comprehensions inside it.
+vars_outside_funs({'fun', _, _}) -> [];
+vars_outside_funs({named_fun, _, _, _}) -> [];
+vars_outside_funs({lc, _, _, _}) -> [];
+vars_outside_funs(T) when element(1, T) =:= var -> vars_in(T);
+vars_outside_funs(T) when is_tuple(T) -> vars_outside_funs(tuple_to_list(T));
+vars_outside_funs(L) when is_list(L) -> lists:flatmap(fun vars_outside_funs/1, L);
+vars_outside_funs(_) -> [].
 
 %% ---------- Calls ----------
 
@@ -349,6 +505,26 @@ compound({'case', _, _, _} = E, St) ->
     via_continuation(E, St);
 compound({'if', _, _} = E, St) ->
     via_continuation(E, St);
+compound({'try', _, _, _, _, _} = E, St) ->
+    via_continuation(E, St);
+compound({'catch', _, E}, St0) ->
+    %% catch Expr: the value, or what the exception turns into
+    {H, St1} = fresh("catch", St0),
+    {R, St2} = fresh("r", St1),
+    {Code, Ref, St3} = expr(E, St2),
+    {["Value ", R, ";\n",
+      "AlkuHandler ", H, ";\n",
+      "alku_try(&", H, ");\n",
+      "if (setjmp(", H, ".env) == 0) {\n",
+      Code,
+      R, " = ", Ref, ";\n",
+      "alku_end_try(&", H, ");\n",
+      "} else {\n",
+      R, " = alku_catch_value(alku_caught_class(), alku_caught_reason());\n",
+      "}\n"], R, St3#st{vars = St2#st.vars}};
+compound({lc, Anno, Template, Qualifiers}, St0) ->
+    {Loop, St1} = list_comprehension(Template, Qualifiers, {nil, Anno}, St0),
+    expr({call, Anno, {remote, Anno, {atom, Anno, lists}, {atom, Anno, reverse}}, [Loop]}, St1);
 compound({block, _, Body}, St) ->
     sequence(Body, St);
 compound({tuple, _, Elements}, St0) ->
@@ -399,6 +575,39 @@ exprs([E | Es], St0) ->
 %% A C array of values, for passing several values to the runtime.
 value_array([]) -> "NULL";
 value_array(Refs) -> ["(Value[]){", lists:join(", ", Refs), "}"].
+
+%% ---------- List comprehensions ----------
+
+%% [T || Qualifiers] is rewritten into named funs that loop over each
+%% generator, collecting results in reverse into Acc; the caller reverses
+%% the result. The loops are tail-recursive, so they run in constant stack.
+list_comprehension(Template, [], Acc, St) ->
+    {{cons, element(2, Acc), Template, Acc}, St};
+list_comprehension(Template, [{generate, A, Pattern, List} | Qs], Acc, St0) ->
+    {LoopName, St1} = fresh_name("Lc@Loop", St0),
+    {TailName, St2} = fresh_name("Lc@Tail", St1),
+    {AccName, St3} = fresh_name("Lc@Acc", St2),
+    Loop = {var, A, LoopName},
+    Tail = {var, A, TailName},
+    LoopAcc = {var, A, AccName},
+    {Inner, St4} = list_comprehension(Template, Qs, LoopAcc, St3),
+    Fun = {named_fun, A, LoopName,
+           [{clause, A, [{cons, A, Pattern, Tail}, LoopAcc], [],
+             [{call, A, Loop, [Tail, Inner]}]},
+            {clause, A, [{cons, A, {var, A, '_'}, Tail}, LoopAcc], [],
+             [{call, A, Loop, [Tail, LoopAcc]}]},
+            {clause, A, [{nil, A}, LoopAcc], [], [LoopAcc]}]},
+    {{call, A, Fun, [List, Acc]}, St4};
+list_comprehension(Template, [Filter | Qs], Acc, St0) ->
+    A = element(2, Filter),
+    {Inner, St1} = list_comprehension(Template, Qs, Acc, St0),
+    {{'case', A, Filter, [{clause, A, [{atom, A, true}], [], [Inner]},
+                          {clause, A, [{atom, A, false}], [], [Acc]}]}, St1}.
+
+%% A variable name that cannot clash with the program's own variables.
+fresh_name(Prefix, St0) ->
+    {N, St1} = next(St0),
+    {list_to_atom(Prefix ++ integer_to_list(N)), St1}.
 
 %% ---------- Funs ----------
 
@@ -554,20 +763,47 @@ builtin(erlang, setelement, 3, _) -> "alku_bif_setelement";
 builtin(erlang, tuple_size, 1, _) -> "alku_bif_tuple_size";
 builtin(erlang, integer_to_list, 1, _) -> "alku_bif_integer_to_list";
 builtin(erlang, atom_to_list, 1, _) -> "alku_bif_atom_to_list";
+builtin(erlang, list_to_integer, 1, _) -> "alku_bif_list_to_integer";
+builtin(erlang, list_to_atom, 1, _) -> "alku_bif_list_to_atom";
+builtin(erlang, tuple_to_list, 1, _) -> "alku_bif_tuple_to_list";
+builtin(erlang, list_to_tuple, 1, _) -> "alku_bif_list_to_tuple";
+builtin(erlang, max, 2, _) -> "alku_bif_max";
+builtin(erlang, min, 2, _) -> "alku_bif_min";
+builtin(erlang, apply, 2, _) -> "alku_bif_apply_2";
+builtin(erlang, throw, 1, _) -> "alku_bif_throw";
+builtin(erlang, error, 1, _) -> "alku_bif_error_1";
+builtin(erlang, error, 2, _) -> "alku_bif_error_2";
+builtin(erlang, exit, 1, _) -> "alku_bif_exit";
+builtin(erlang, halt, 0, _) -> "alku_bif_halt_0";
+builtin(erlang, halt, 1, _) -> "alku_bif_halt_1";
 builtin(lists, reverse, 1, _) -> "alku_lists_reverse_1";
 builtin(lists, reverse, 2, _) -> "alku_lists_reverse_2";
 builtin(io, write, 1, _) -> "alku_io_write";
+builtin(io, write, 2, _) -> "alku_io_write_2";
 builtin(io, nl, 0, _) -> "alku_io_nl";
+builtin(io, nl, 1, _) -> "alku_io_nl_1";
 builtin(io, format, 1, _) -> "alku_io_format_1";
 builtin(io, format, 2, _) -> "alku_io_format_2";
+builtin(io, format, 3, _) -> "alku_io_format_3";
+builtin(io, put_chars, 1, _) -> "alku_io_put_chars_1";
+builtin(io, put_chars, 2, _) -> "alku_io_put_chars_2";
+builtin(io, get_line, 1, _) -> "alku_io_get_line_1";
+builtin(io, get_line, 2, _) -> "alku_io_get_line_2";
+builtin(file, open, 2, _) -> "alku_file_open";
+builtin(file, close, 1, _) -> "alku_file_close";
+builtin(file, write_file, 2, _) -> "alku_file_write_file";
 builtin(Module, Name, Arity, Anno) ->
     fail(Anno, io_lib:format("~s:~s/~b is not available in Alku yet",
                              [Module, Name, Arity])).
 
 %% ---------- State and errors ----------
 
-fresh(Prefix, #st{n = N} = St) ->
-    {Prefix ++ "_" ++ integer_to_list(N), St#st{n = N + 1}}.
+next(#st{n = N} = St) ->
+    {N, St#st{n = N + 1}}.
+
+fresh(Prefix, St0) ->
+    {N, St1} = next(St0),
+    {Prefix ++ "_" ++ integer_to_list(N), St1}.
 
 fresh_var(Name, #st{n = N, vars = Vars} = St) ->
     CVar = alku_c:var_name(Name, N),
@@ -583,10 +819,7 @@ unsupported(E) ->
                map -> "maps are";
                map_field_assoc -> "maps are";
                record -> "records are";
-               lc -> "list comprehensions are";
                bin -> "binaries are";
-               'try' -> "try expressions are";
-               'catch' -> "catch expressions are";
                'receive' -> "receive expressions are (Alku has no processes)";
                _ -> "this kind of expression or pattern is"
            end,
