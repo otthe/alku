@@ -1,0 +1,8 @@
+{application, alku, [
+    {description, "A compiled language with the syntax of sequential Erlang"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {env, []},
+    {modules, []}
+]}.
