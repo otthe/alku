@@ -1,37 +1,16 @@
 #include "alku_runtime.h"
+#include "alku_gc.h"
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* ---------- Memory ---------- */
-
-/* Heap values are carved out of large blocks and never freed: Alku
- * programs are short-lived for now. A garbage collector comes later. */
-#define BLOCK_SIZE ((size_t)1 << 20)
-
 static _Noreturn void out_of_memory(void) {
     fputs("** out of memory\n", stderr);
     exit(1);
-}
-
-static unsigned char *block_next;
-static size_t block_left;
-
-static void *allocate(size_t size) {
-    size = (size + 15) & ~(size_t)15; /* keep everything 16-byte aligned */
-    if (block_left < size) {
-        size_t block = size > BLOCK_SIZE ? size : BLOCK_SIZE;
-        block_next = malloc(block);
-        if (block_next == NULL) out_of_memory();
-        block_left = block;
-    }
-    void *p = block_next;
-    block_next += size;
-    block_left -= size;
-    return p;
 }
 
 /* ---------- Output buffer ---------- */
@@ -176,6 +155,19 @@ static void print_value(Buffer *b, Value v, bool pretty) {
     case ALKU_ATOM:
         print_atom(b, v.as.atom);
         break;
+    case ALKU_FUN:
+        /* "fun lists:map/2" for external funs, #Fun<...> for the rest */
+        if (strncmp(v.as.fun->name, "fun ", 4) == 0) {
+            buf_puts(b, v.as.fun->name);
+        } else {
+            buf_puts(b, "#Fun<");
+            buf_puts(b, v.as.fun->name);
+            buf_putc(b, '>');
+        }
+        break;
+    case ALKU_PENDING:
+        buf_puts(b, "<pending call>"); /* never seen by Alku code */
+        break;
     case ALKU_TUPLE:
         buf_putc(b, '{');
         for (size_t i = 0; i < v.as.tuple->arity; i++) {
@@ -258,6 +250,22 @@ _Noreturn void alku_error_function_clause(const char *name, int arity, const Val
     exit(1);
 }
 
+static _Noreturn void badfun(Value v) {
+    fail("bad function %v", &v);
+}
+
+static _Noreturn void badarity(Value fun, size_t arity) {
+    Buffer b = {0};
+    buf_puts(&b, "** exception error: ");
+    print_value(&b, fun, true);
+    buf_puts(&b, " called with ");
+    buf_int(&b, (int64_t)arity);
+    buf_puts(&b, arity == 1 ? " argument\n" : " arguments\n");
+    fflush(stdout);
+    buf_flush(&b, stderr);
+    exit(1);
+}
+
 _Noreturn void alku_error_badmatch(Value v) {
     fail("no match of right hand side value %v", &v);
 }
@@ -294,7 +302,7 @@ Value alku_nil(void) {
 }
 
 Value alku_cons(Value head, Value tail) {
-    AlkuCons *cell = allocate(sizeof *cell);
+    AlkuCons *cell = gc_alloc(GC_CONS, sizeof *cell);
     cell->head = head;
     cell->tail = tail;
     Value v;
@@ -303,13 +311,32 @@ Value alku_cons(Value head, Value tail) {
     return v;
 }
 
+/* elements may be NULL: the tuple is then filled with [] */
 Value alku_make_tuple(size_t arity, const Value *elements) {
-    AlkuTuple *t = allocate(sizeof *t + arity * sizeof(Value));
+    AlkuTuple *t = gc_alloc(GC_TUPLE, sizeof *t + arity * sizeof(Value));
     t->arity = arity;
-    for (size_t i = 0; i < arity; i++) t->elements[i] = elements[i];
+    for (size_t i = 0; i < arity; i++) t->elements[i] = elements ? elements[i] : alku_nil();
     Value v;
     v.tag = ALKU_TUPLE;
     v.as.tuple = t;
+    return v;
+}
+
+Value alku_make_fun(AlkuCode code, size_t arity, const char *name,
+                    size_t free_count, const Value *env) {
+    AlkuFun *f = gc_alloc(GC_FUN, sizeof *f + free_count * sizeof(Value));
+    f->code = code;
+    f->arity = arity;
+    f->name = name;
+    f->free_count = free_count;
+    for (size_t i = 0; i < free_count; i++) f->env[i] = env[i];
+    return alku_fun_value(f);
+}
+
+Value alku_fun_value(AlkuFun *fun) {
+    Value v;
+    v.tag = ALKU_FUN;
+    v.as.fun = fun;
     return v;
 }
 
@@ -389,7 +416,20 @@ static int compare(Value a, Value b) {
         case ALKU_ATOM:
             return sign(strcmp(a.as.atom, b.as.atom));
         case ALKU_NIL:
+        case ALKU_PENDING:
             return 0;
+        case ALKU_FUN: {
+            /* same code and same captured values means equal */
+            AlkuFun *f = a.as.fun, *g = b.as.fun;
+            if (f->code != g->code) {
+                return (uintptr_t)f->code < (uintptr_t)g->code ? -1 : 1;
+            }
+            for (size_t i = 0; i < f->free_count; i++) {
+                int c = compare(f->env[i], g->env[i]);
+                if (c != 0) return c;
+            }
+            return 0;
+        }
         case ALKU_TUPLE: {
             size_t n = a.as.tuple->arity, m = b.as.tuple->arity;
             if (n != m) return n < m ? -1 : 1; /* smaller tuples come first */
@@ -546,8 +586,10 @@ Value alku_op_append(Value a, Value b) {
 Value alku_op_subtract(Value a, Value b) {
     size_t n = proper_length(a);
     (void)proper_length(b);
-    Value *items = allocate(n * sizeof(Value) + 1);
-    bool *removed = allocate(n * sizeof(bool) + 1);
+    /* a tuple, so the collector can see the copied values */
+    Value *items = alku_make_tuple(n, NULL).as.tuple->elements;
+    bool *removed = malloc(n + 1);
+    if (removed == NULL) out_of_memory();
     size_t i = 0;
     for (Value v = a; v.tag == ALKU_CONS; v = v.as.cons->tail, i++) {
         items[i] = v.as.cons->head;
@@ -565,6 +607,7 @@ Value alku_op_subtract(Value a, Value b) {
     for (i = 0; i < n; i++) {
         if (!removed[i]) list_push(&lb, items[i]);
     }
+    free(removed);
     return list_finish(&lb, alku_nil());
 }
 
@@ -574,6 +617,12 @@ Value alku_bif_is_integer(Value v) { return boolean(v.tag == ALKU_INT); }
 Value alku_bif_is_atom(Value v) { return boolean(v.tag == ALKU_ATOM); }
 Value alku_bif_is_list(Value v) { return boolean(v.tag == ALKU_NIL || v.tag == ALKU_CONS); }
 Value alku_bif_is_tuple(Value v) { return boolean(v.tag == ALKU_TUPLE); }
+Value alku_bif_is_function_1(Value v) { return boolean(v.tag == ALKU_FUN); }
+
+Value alku_bif_is_function_2(Value v, Value arity) {
+    if (arity.tag != ALKU_INT || arity.as.integer < 0) badarg(arity);
+    return boolean(v.tag == ALKU_FUN && v.as.fun->arity == (uint64_t)arity.as.integer);
+}
 
 Value alku_bif_is_boolean(Value v) {
     return boolean(is_atom_named(v, "true") || is_atom_named(v, "false"));
@@ -738,4 +787,75 @@ Value alku_io_format_2(Value format, Value args) {
 
 Value alku_io_format_1(Value format) {
     return alku_io_format_2(format, alku_nil());
+}
+
+/* ---------- Calls, tail calls and program start ---------- */
+
+/* The one pending tail call. Erlang functions have at most 255 arguments. */
+static struct {
+    AlkuCode code;
+    AlkuFun *self;
+    Value args[256];
+} pending;
+
+static Value pending_marker(void) {
+    Value v;
+    v.tag = ALKU_PENDING;
+    v.as.integer = 0;
+    return v;
+}
+
+Value alku_tail_call(AlkuCode code, AlkuFun *self, size_t arity, const Value *args) {
+    pending.code = code;
+    pending.self = self;
+    for (size_t i = 0; i < arity; i++) pending.args[i] = args[i];
+    return pending_marker();
+}
+
+/* Compiled functions copy their arguments before doing anything else, so
+ * the next tail call may safely reuse pending.args. */
+Value alku_run_pending(void) {
+    return pending.code(pending.args, pending.self);
+}
+
+static AlkuFun *checked_fun(Value fun, size_t arity) {
+    if (fun.tag != ALKU_FUN) badfun(fun);
+    if (fun.as.fun->arity != arity) badarity(fun, arity);
+    return fun.as.fun;
+}
+
+Value alku_apply(Value fun, size_t arity, const Value *args) {
+    AlkuFun *f = checked_fun(fun, arity);
+    return f->code(args, f);
+}
+
+Value alku_tail_apply(Value fun, size_t arity, const Value *args) {
+    AlkuFun *f = checked_fun(fun, arity);
+    return alku_tail_call(f->code, f, arity, args);
+}
+
+/* Programs run on a thread with a big stack, so deep (non-tail) recursion
+ * over long lists works as it does in Erlang. Only the pages actually used
+ * take memory. */
+#define STACK_SIZE ((size_t)512 * 1024 * 1024)
+
+static void *run_main(void *main) {
+    gc_init(__builtin_frame_address(0));
+    gc_add_root(&pending, sizeof pending);
+    (void)alku_settle(((AlkuCode)(uintptr_t)main)(NULL, NULL));
+    fflush(stdout);
+    return NULL;
+}
+
+int alku_start(AlkuCode main) {
+    pthread_attr_t attr;
+    pthread_t thread;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, STACK_SIZE);
+    if (pthread_create(&thread, &attr, run_main, (void *)(uintptr_t)main) != 0) {
+        fputs("** could not start the program thread\n", stderr);
+        return 1;
+    }
+    pthread_join(thread, NULL);
+    return 0;
 }

@@ -19,7 +19,7 @@ main(_) -> io:put_chars(standard_error, ?USAGE), halt(2).
 run(Src) ->
     Exe = alku_os:temp_file("alku_run"),
     compile_or_halt(Src, Exe),
-    {Status, ok} = alku_os:run(Exe, [], fun(Data, ok) -> io:put_chars(Data) end, ok),
+    {Status, ok} = alku_os:run(Exe, [], [], fun(Data, ok) -> io:put_chars(Data) end, ok),
     _ = file:delete(Exe),
     halt(Status).
 

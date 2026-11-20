@@ -11,23 +11,24 @@
 
 examples_test_() ->
     Sources = filelib:wildcard(filename:join(?EXAMPLES, "*.erl")),
-    [{Src, fun() -> check(Src) end} || Src <- Sources].
+    [{Src, {timeout, 120, fun() -> check(Src) end}} || Src <- Sources].
 
+%% Each program runs twice: normally, and with the garbage collector
+%% running very often (ALKU_GC_STRESS) to shake out memory bugs.
 check(Src) ->
     {ok, Expected} = file:read_file(filename:rootname(Src) ++ ".expected"),
-    ?assertEqual(Expected, output(Src)).
-
-%% Everything a user would see: warnings, then program output, or the errors.
-output(Src) ->
     Exe = alku_os:temp_file("alku_test"),
     case alku_compiler:build(Src, Exe) of
         {ok, Warnings} ->
-            {_Status, Output} = alku_os:run(Exe, []),
+            {_, Normal} = alku_os:run(Exe, []),
+            {_, Stressed} = alku_os:run(Exe, [], [{"ALKU_GC_STRESS", "1"}]),
             ok = file:delete(Exe),
-            unicode:characters_to_binary([lines(Warnings), Output]);
+            ?assertEqual(Expected, output(Warnings, Normal)),
+            ?assertEqual(Expected, output(Warnings, Stressed));
         {error, Errors} ->
-            unicode:characters_to_binary(lines(Errors))
+            ?assertEqual(Expected, output(Errors, <<>>))
     end.
 
-lines(Messages) ->
-    [[M, "\n"] || M <- Messages].
+%% Everything a user would see: compiler messages, then program output.
+output(Messages, ProgramOutput) ->
+    unicode:characters_to_binary([[[M, "\n"] || M <- Messages], ProgramOutput]).

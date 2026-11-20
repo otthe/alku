@@ -1,21 +1,29 @@
 %% @doc Running external programs and creating temporary file names.
 -module(alku_os).
 
--export([run/2, run/4, temp_file/1]).
+-export([run/2, run/3, run/5, temp_file/1]).
+
+-type env() :: [{string(), string()}].
 
 %% Runs Exe (an absolute path) and returns its exit status and all output
 %% (stdout and stderr combined).
 -spec run(file:filename(), [string()]) -> {non_neg_integer(), binary()}.
 run(Exe, Args) ->
-    {Status, Chunks} = run(Exe, Args, fun(Data, Acc) -> [Acc, Data] end, []),
+    run(Exe, Args, []).
+
+%% Like run/2, with extra environment variables.
+-spec run(file:filename(), [string()], env()) -> {non_neg_integer(), binary()}.
+run(Exe, Args, Env) ->
+    {Status, Chunks} = run(Exe, Args, Env, fun(Data, Acc) -> [Acc, Data] end, []),
     {Status, iolist_to_binary(Chunks)}.
 
-%% Like run/2, but folds Fun over the output as it arrives.
--spec run(file:filename(), [string()], fun((binary(), Acc) -> Acc), Acc) ->
+%% Like run/3, but folds Fun over the output as it arrives.
+-spec run(file:filename(), [string()], env(), fun((binary(), Acc) -> Acc), Acc) ->
     {non_neg_integer(), Acc}.
-run(Exe, Args, Fun, Acc0) ->
+run(Exe, Args, Env, Fun, Acc0) ->
     Port = open_port({spawn_executable, Exe},
-                     [{args, Args}, binary, exit_status, stderr_to_stdout, use_stdio]),
+                     [{args, Args}, {env, Env}, binary, exit_status,
+                      stderr_to_stdout, use_stdio]),
     collect(Port, Fun, Acc0).
 
 collect(Port, Fun, Acc) ->

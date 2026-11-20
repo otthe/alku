@@ -3,12 +3,13 @@
 -include_lib("eunit/include/eunit.hrl").
 
 function_name_test() ->
-    ?assertEqual("alku_fact_1", alku_c:function_name(fact, 1)),
-    ?assertEqual("alku_is_even_1", alku_c:function_name(is_even, 1)),
-    ?assertEqual("alku_main_0", alku_c:function_name(main, 0)).
+    ?assertEqual("alku_math__fact_1", alku_c:function_name(math, fact, 1)),
+    ?assertEqual("alku_my_mod__is_even_1", alku_c:function_name(my_mod, is_even, 1)),
+    ?assertEqual("alku_m__main_0", alku_c:function_name(m, main, 0)).
 
 function_name_escapes_unusual_atoms_test() ->
-    ?assertEqual("alkuq_614062_2", alku_c:function_name('a@b', 2)).
+    ?assertEqual("alku_m__q614062_2", alku_c:function_name(m, 'a@b', 2)),
+    ?assertEqual("alku_q615f5f62__f_0", alku_c:function_name(a__b, f, 0)).
 
 var_name_test() ->
     ?assertEqual("v3_N", alku_c:var_name('N', 3)),

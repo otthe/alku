@@ -2,23 +2,20 @@
 %% indentation. Kept separate from code generation so they are easy to test.
 -module(alku_c).
 
--export([function_name/2, var_name/2, string_literal/1, int64_literal/1,
+-export([function_name/3, var_name/2, string_literal/1, int64_literal/1,
          fits_int64/1, indent/1]).
 
 -define(INT64_MIN, -9223372036854775808).
 -define(INT64_MAX, 9223372036854775807).
 
-%% C name of the Alku function Name/Arity, e.g. fact/1 -> "alku_fact_1".
-%% Names with characters C does not allow are hex-encoded under a different
-%% prefix, so two different functions can never get the same C name.
--spec function_name(atom(), non_neg_integer()) -> string().
-function_name(Name, Arity) ->
-    String = atom_to_list(Name),
-    Stem = case lists:all(fun is_ident_char/1, String) of
-               true -> "alku_" ++ String;
-               false -> "alkuq_" ++ hex(String)
-           end,
-    Stem ++ "_" ++ integer_to_list(Arity).
+%% C name of the function Module:Name/Arity, e.g. "alku_math__fact_1".
+%% "__" separates the module from the function; module names containing
+%% "__" or unusual characters are hex-encoded, as are such function names
+%% (under the "q" prefix), so different functions never share a C name.
+-spec function_name(atom(), atom(), non_neg_integer()) -> string().
+function_name(Module, Name, Arity) ->
+    "alku_" ++ module_part(atom_to_list(Module)) ++ "__" ++
+        name_part(atom_to_list(Name)) ++ "_" ++ integer_to_list(Arity).
 
 %% C name for an Erlang variable. The counter N makes it unique, so
 %% unusual characters can simply be replaced.
@@ -50,6 +47,19 @@ indent(Code) ->
     lists:join("\n", Indented).
 
 %% Internal
+
+module_part(String) ->
+    case lists:all(fun is_ident_char/1, String) andalso
+         string:find(String, "__") =:= nomatch of
+        true -> String;
+        false -> "q" ++ hex(String)
+    end.
+
+name_part(String) ->
+    case lists:all(fun is_ident_char/1, String) of
+        true -> String;
+        false -> "q" ++ hex(String)
+    end.
 
 indent_line(<<>>, Depth) ->
     {<<>>, Depth};

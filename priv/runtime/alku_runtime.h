@@ -3,8 +3,14 @@
  * operations that generated code calls.
  *
  * Every Alku value is a small struct passed by value. Integers and atoms
- * live inside the struct; tuples and list cells live on the heap and the
- * struct points to them. Strings are lists of character codes, as in Erlang.
+ * live inside the struct; tuples, list cells and funs live on the
+ * garbage-collected heap and the struct points to them. Strings are lists
+ * of character codes, as in Erlang.
+ *
+ * Calling convention: every compiled Alku function (and every fun body)
+ * has the type AlkuCode: it receives its arguments as an array, plus the
+ * fun object it belongs to (NULL for named functions). A function may
+ * return a "pending tail call" instead of a value; see alku_settle.
  */
 #ifndef ALKU_RUNTIME_H
 #define ALKU_RUNTIME_H
@@ -14,17 +20,20 @@
 #include <stdint.h>
 
 /* Tags are declared in Erlang term order:
- * number < atom < tuple < nil < list. */
+ * number < atom < fun < tuple < nil < list. */
 typedef enum {
     ALKU_INT,
     ALKU_ATOM,
+    ALKU_FUN,
     ALKU_TUPLE,
     ALKU_NIL,
-    ALKU_CONS
+    ALKU_CONS,
+    ALKU_PENDING /* not a term: marks a pending tail call */
 } AlkuTag;
 
 typedef struct AlkuTuple AlkuTuple;
 typedef struct AlkuCons AlkuCons;
+typedef struct AlkuFun AlkuFun;
 
 typedef struct {
     AlkuTag tag;
@@ -33,8 +42,11 @@ typedef struct {
         const char *atom; /* UTF-8 name; atoms are compared by name */
         AlkuTuple *tuple;
         AlkuCons *cons;
+        AlkuFun *fun;
     } as;
 } Value;
+
+typedef Value (*AlkuCode)(const Value *args, AlkuFun *self);
 
 struct AlkuTuple {
     size_t arity;
@@ -47,6 +59,33 @@ struct AlkuCons {
     Value tail;
 };
 
+/* A fun: code plus the variables it captured. */
+struct AlkuFun {
+    AlkuCode code;
+    size_t arity;
+    const char *name; /* for printing */
+    size_t free_count;
+    Value env[];
+};
+
+/* Program entry: runs main (an Alku function of arity 0) and returns the
+ * process exit status. */
+int alku_start(AlkuCode main);
+
+/* Calls and tail calls */
+Value alku_apply(Value fun, size_t arity, const Value *args);
+Value alku_tail_apply(Value fun, size_t arity, const Value *args);
+Value alku_tail_call(AlkuCode code, AlkuFun *self, size_t arity, const Value *args);
+Value alku_run_pending(void);
+
+/* A tail call returns a pending marker instead of calling the target, so
+ * the C stack does not grow. Every non-tail call site runs pending calls
+ * until a real value comes back. */
+static inline Value alku_settle(Value v) {
+    while (v.tag == ALKU_PENDING) v = alku_run_pending();
+    return v;
+}
+
 /* Constructors */
 Value alku_int(int64_t n);
 Value alku_atom(const char *name);
@@ -54,6 +93,9 @@ Value alku_nil(void);
 Value alku_cons(Value head, Value tail);
 Value alku_make_tuple(size_t arity, const Value *elements);
 Value alku_string(const char *utf8, size_t length);
+Value alku_make_fun(AlkuCode code, size_t arity, const char *name,
+                    size_t free_count, const Value *env);
+Value alku_fun_value(AlkuFun *fun);
 
 /* Tests used by pattern matching, guards and andalso/orelse */
 bool alku_exact_eq(Value a, Value b);
@@ -99,6 +141,8 @@ Value alku_bif_is_atom(Value v);
 Value alku_bif_is_boolean(Value v);
 Value alku_bif_is_list(Value v);
 Value alku_bif_is_tuple(Value v);
+Value alku_bif_is_function_1(Value v);
+Value alku_bif_is_function_2(Value v, Value arity);
 Value alku_bif_abs(Value v);
 Value alku_bif_hd(Value list);
 Value alku_bif_tl(Value list);
