@@ -59,13 +59,9 @@ function({function, _, Name, Arity, Clauses}, St) ->
                [] -> "void";
                _ -> lists:join(", ", ["Value " ++ P || P <- Params])
            end,
-    Args = case Params of
-               [] -> "NULL";
-               _ -> ["(Value[]){", lists:join(", ", Params), "}"]
-           end,
     Done = fun(Ref) -> ["return ", Ref, ";\n"] end,
     NoMatch = ["alku_error_function_clause(", atom_literal_name(Name), ", ",
-               integer_to_list(Arity), ", ", Args, ");\n"],
+               integer_to_list(Arity), ", ", value_array(Params), ");\n"],
     {Body, _} = clauses(Clauses, Params, Done, NoMatch, St),
     ["static Value ", alku_c:function_name(Name, Arity), "(", Decl, ") {\n",
      Body, "}\n\n"].
@@ -114,6 +110,18 @@ pattern({var, _, Name}, Subject, Fail, St0) ->
             {CVar, St1} = fresh_var(Name, St0),
             {["Value ", CVar, " = ", Subject, ";\n"], St1}
     end;
+pattern({tuple, _, Elements}, Subject, Fail, St0) ->
+    Size = integer_to_list(length(Elements)),
+    Subjects = [["alku_tuple_element(", Subject, ", ", integer_to_list(I), ")"]
+                || I <- lists:seq(0, length(Elements) - 1)],
+    {Code, St1} = patterns(Elements, Subjects, Fail, St0),
+    {[check(["alku_is_tuple_of(", Subject, ", ", Size, ")"], Fail), Code], St1};
+pattern({cons, _, Head, Tail}, Subject, Fail, St0) ->
+    Subjects = [["alku_head(", Subject, ")"], ["alku_tail(", Subject, ")"]],
+    {Code, St1} = patterns([Head, Tail], Subjects, Fail, St0),
+    {[check(["alku_is_cons(", Subject, ")"], Fail), Code], St1};
+pattern({string, Anno, Chars}, Subject, Fail, St) ->
+    pattern(string_to_list_pattern(Chars, Anno), Subject, Fail, St);
 pattern({match, _, P1, P2}, Subject, Fail, St0) ->
     {Code1, St1} = pattern(P1, Subject, Fail, St0),
     {Code2, St2} = pattern(P2, Subject, Fail, St1),
@@ -125,6 +133,12 @@ pattern(P, Subject, Fail, St) ->
         error ->
             unsupported(P)
     end.
+
+%% "abc" in a pattern means [$a, $b, $c].
+string_to_list_pattern([], Anno) ->
+    {nil, Anno};
+string_to_list_pattern([C | Cs], Anno) ->
+    {cons, Anno, {char, Anno, C}, string_to_list_pattern(Cs, Anno)}.
 
 %% Guards are a list of alternatives (separated by ;), each a list of
 %% tests (separated by ,) that must all be true.
@@ -206,6 +220,19 @@ compound({call, Anno, {remote, _, {atom, _, Module}, {atom, _, Name}}, Args},
     compound({call, Anno, {atom, Anno, Name}, Args}, St);
 compound({call, Anno, {remote, _, {atom, _, Module}, {atom, _, Name}}, Args}, St) ->
     call(builtin(Module, Name, length(Args), Anno), Args, St);
+compound({tuple, _, Elements}, St0) ->
+    {Codes, Refs, St1} = exprs(Elements, St0),
+    {CodeT, T, St2} = temp(["alku_make_tuple(", integer_to_list(length(Refs)), ", ",
+                            value_array(Refs), ")"], St1),
+    {[Codes, CodeT], T, St2};
+compound({cons, _, Head, Tail}, St0) ->
+    {Codes, [RefH, RefT], St1} = exprs([Head, Tail], St0),
+    {CodeT, T, St2} = temp(["alku_cons(", RefH, ", ", RefT, ")"], St1),
+    {[Codes, CodeT], T, St2};
+compound({string, _, Chars}, St) ->
+    Bytes = unicode:characters_to_binary(Chars),
+    temp(["alku_string(", alku_c:string_literal(Bytes), ", ",
+          integer_to_list(byte_size(Bytes)), ")"], St);
 compound({'case', _, E, Clauses}, St0) ->
     {Code, Ref, St1} = expr(E, St0),
     {Branch, Result, St2} =
@@ -246,6 +273,10 @@ call(CFun, Args, St0) ->
     {CodeT, T, St2} = temp([CFun, "(", lists:join(", ", Refs), ")"], St1),
     {[Codes, CodeT], T, St2}.
 
+%% A C array of values, for passing several values to the runtime.
+value_array([]) -> "NULL";
+value_array(Refs) -> ["(Value[]){", lists:join(", ", Refs), "}"].
+
 exprs([], St) ->
     {[], [], St};
 exprs([E | Es], St0) ->
@@ -259,6 +290,7 @@ literal({integer, Anno, N}) -> {ok, int_literal(N, Anno)};
 literal({char, Anno, C}) -> {ok, int_literal(C, Anno)};
 literal({op, Anno, '-', {integer, _, N}}) -> {ok, int_literal(-N, Anno)};
 literal({atom, _, A}) -> {ok, ["alku_atom(", atom_literal_name(A), ")"]};
+literal({nil, _}) -> {ok, "alku_nil()"};
 literal(_) -> error.
 
 int_literal(N, Anno) ->
@@ -289,6 +321,8 @@ binary_op('>=', _) -> "alku_op_ge";
 binary_op('and', _) -> "alku_op_and";
 binary_op('or', _) -> "alku_op_or";
 binary_op('xor', _) -> "alku_op_xor";
+binary_op('++', _) -> "alku_op_append";
+binary_op('--', _) -> "alku_op_subtract";
 binary_op('/', Anno) ->
     fail(Anno, "the / operator needs floats, which are not supported yet; use div");
 binary_op(Op, Anno) ->
@@ -304,9 +338,23 @@ unary_op(Op, Anno) ->
 builtin(erlang, is_integer, 1, _) -> "alku_bif_is_integer";
 builtin(erlang, is_atom, 1, _) -> "alku_bif_is_atom";
 builtin(erlang, is_boolean, 1, _) -> "alku_bif_is_boolean";
+builtin(erlang, is_list, 1, _) -> "alku_bif_is_list";
+builtin(erlang, is_tuple, 1, _) -> "alku_bif_is_tuple";
 builtin(erlang, abs, 1, _) -> "alku_bif_abs";
+builtin(erlang, hd, 1, _) -> "alku_bif_hd";
+builtin(erlang, tl, 1, _) -> "alku_bif_tl";
+builtin(erlang, length, 1, _) -> "alku_bif_length";
+builtin(erlang, element, 2, _) -> "alku_bif_element";
+builtin(erlang, setelement, 3, _) -> "alku_bif_setelement";
+builtin(erlang, tuple_size, 1, _) -> "alku_bif_tuple_size";
+builtin(erlang, integer_to_list, 1, _) -> "alku_bif_integer_to_list";
+builtin(erlang, atom_to_list, 1, _) -> "alku_bif_atom_to_list";
+builtin(lists, reverse, 1, _) -> "alku_lists_reverse_1";
+builtin(lists, reverse, 2, _) -> "alku_lists_reverse_2";
 builtin(io, write, 1, _) -> "alku_io_write";
 builtin(io, nl, 0, _) -> "alku_io_nl";
+builtin(io, format, 1, _) -> "alku_io_format_1";
+builtin(io, format, 2, _) -> "alku_io_format_2";
 builtin(Module, Name, Arity, Anno) ->
     fail(Anno, io_lib:format("~s:~s/~b is not available in Alku yet",
                               [Module, Name, Arity])).
@@ -326,10 +374,6 @@ temp(CExpr, St0) ->
 
 unsupported(E) ->
     What = case element(1, E) of
-               string -> "strings are";
-               cons -> "lists are";
-               nil -> "lists are";
-               tuple -> "tuples are";
                float -> "floats are";
                'fun' -> "funs are";
                named_fun -> "funs are";
@@ -341,7 +385,7 @@ unsupported(E) ->
                'try' -> "try expressions are";
                'catch' -> "catch expressions are";
                'receive' -> "receive expressions are (Alku has no processes)";
-               _ -> "this kind of expression is"
+               _ -> "this kind of expression or pattern is"
            end,
     fail(element(2, E), [What, " not supported in Alku yet"]).
 

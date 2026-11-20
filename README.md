@@ -42,22 +42,33 @@ alku c FILE.erl                   # show the generated C code
 you can put it on your PATH, e.g.
 `ln -s "$PWD/_build/default/bin/alku" ~/.local/bin/alku`.
 
-## What works now (phase 1)
+## What works now (phase 2)
 
-- Integers (64-bit; overflow is a runtime error) and atoms
+- Integers (64-bit; overflow is a runtime error), atoms, tuples, lists
+  and strings (lists of character codes, as in Erlang)
 - Functions with multiple clauses, pattern matching and guards (`,` and `;`)
-- `case`, `if`, `begin ... end`, `=` matches, repeated variables in patterns
-- Operators: `+ - * div rem`, comparisons, `and or xor not andalso orelse`
-- Built-ins: `is_integer/1`, `is_atom/1`, `is_boolean/1`, `abs/1`,
-  `io:write/1`, `io:nl/0`
+- Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`, `P1 = P2`,
+  repeated variables
+- `case`, `if`, `begin ... end`, `=` matches
+- Operators: `+ - * div rem`, comparisons (full Erlang term order),
+  `and or xor not andalso orelse`, `++ --`
+- Built-ins: `is_integer/1`, `is_atom/1`, `is_boolean/1`, `is_list/1`,
+  `is_tuple/1`, `abs/1`, `hd/1`, `tl/1`, `length/1`, `element/2`,
+  `setelement/3`, `tuple_size/1`, `integer_to_list/1`, `atom_to_list/1`,
+  `lists:reverse/1,2`, `io:write/1`, `io:nl/0`, `io:format/1,2`
+- `io:format` controls: `~w ~p ~s ~c ~b ~B ~n ~~` (no field widths)
 - Erlang-style runtime errors (`no function clause matching f(5)`, ...)
 - Compile errors and warnings from Erlang's own linter
 
-Programs that use only these features are also valid Erlang, so they
-give the same output under `erl`.
+Programs that use only these features are also valid Erlang and print
+the same output under `erl`. One difference: `~p` never breaks long
+terms over several lines.
 
-Not yet: lists, tuples, strings, floats, funs, big integers, using a
-variable after the `case` that bound it.
+Memory is never freed yet (a garbage collector comes later), which is
+fine for short-running programs.
+
+Not yet: floats, funs, maps, binaries, big integers, `"abc" ++ Rest`
+patterns, using a variable after the `case` that bound it.
 
 ## How it is organised
 
