@@ -1,12 +1,13 @@
 /*
- * Binaries and the bit syntax.
+ * Binaries, bitstrings and the bit syntax.
  *
  * Bits are numbered from the most significant bit of the first byte, as
- * in Erlang. Segments may have any size in bits, but a finished binary
- * must be a whole number of bytes (Alku has no bitstrings).
+ * in Erlang. A bitstring whose length is not a whole number of bytes
+ * keeps its last few bits in the top of one extra byte.
  *
  * Matching <<X, Rest/binary>> does not copy: Rest is a small sub-binary
- * pointing into the original bytes.
+ * pointing into the original bytes. (Parts that do not start and end on a
+ * byte boundary are copied.)
  */
 #include "alku_internal.h"
 #include "alku_gc.h"
@@ -23,14 +24,26 @@ static Value binary_value(AlkuBinary *b) {
     return v;
 }
 
-/* A new binary owning a copy of the bytes. */
-Value make_binary(const void *bytes, size_t n) {
+size_t bitstring_bits(const AlkuBinary *b) {
+    return b->size * 8 + b->extra;
+}
+
+/* A new bitstring owning a copy of the first `bits` bits of data. */
+Value make_bitstring(const void *data, size_t bits) {
+    size_t n = (bits + 7) / 8;
     AlkuBinary *b = gc_alloc(GC_BINARY, sizeof *b + n);
-    b->size = n;
+    b->size = bits / 8;
+    b->extra = (unsigned)(bits % 8);
     b->parent = NULL;
-    if (n > 0) memcpy(b->data, bytes, n);
+    if (n > 0) memcpy(b->data, data, n);
+    if (b->extra) b->data[n - 1] &= (unsigned char)(0xFF << (8 - b->extra));
     b->bytes = b->data;
     return binary_value(b);
+}
+
+/* A new binary owning a copy of the bytes. */
+Value make_binary(const void *bytes, size_t n) {
+    return make_bitstring(bytes, n * 8);
 }
 
 /* Bytes [offset, offset + n) of an existing binary, without copying. */
@@ -38,26 +51,58 @@ static Value sub_binary(const AlkuBinary *of, size_t offset, size_t n) {
     AlkuBinary *owner = of->parent ? of->parent : (AlkuBinary *)of;
     AlkuBinary *b = gc_alloc(GC_BINARY, sizeof *b);
     b->size = n;
+    b->extra = 0;
     b->bytes = of->bytes + offset;
     b->parent = owner;
     return binary_value(b);
 }
 
+static void put_bits(AlkuBinBuilder *b, const unsigned char *src, size_t from, size_t nbits);
+
+/* Bits [pos, pos + nbits) of a bitstring: shared when they are whole
+ * bytes, copied otherwise. */
+static Value sub_bits(const AlkuBinary *of, size_t pos, size_t nbits) {
+    if (pos % 8 == 0 && nbits % 8 == 0) return sub_binary(of, pos / 8, nbits / 8);
+    AlkuBinBuilder copy;
+    alku_bin_begin(&copy);
+    put_bits(&copy, of->bytes, pos, nbits);
+    return alku_bin_end(&copy);
+}
+
+/* A binary (whole bytes); bitstrings are a bad argument here. */
 static AlkuBinary *binary_arg(Value v) {
+    if (v.tag != ALKU_BINARY || v.as.binary->extra != 0) badarg(v);
+    return v.as.binary;
+}
+
+static AlkuBinary *bitstring_arg(Value v) {
     if (v.tag != ALKU_BINARY) badarg(v);
     return v.as.binary;
 }
 
+/* The bytes of a binary, for iodata and text. */
 void append_binary(Buffer *b, Value v) {
-    for (size_t i = 0; i < v.as.binary->size; i++) buf_putc(b, (char)v.as.binary->bytes[i]);
+    const AlkuBinary *bin = binary_arg(v);
+    for (size_t i = 0; i < bin->size; i++) buf_putc(b, (char)bin->bytes[i]);
 }
 
+static int get_bit(const unsigned char *data, size_t pos) {
+    return (data[pos >> 3] >> (7 - (pos & 7))) & 1;
+}
+
+/* Bit by bit, as Erlang orders bitstrings; a prefix comes first. */
 int compare_binaries(Value a, Value b) {
     const AlkuBinary *x = a.as.binary, *y = b.as.binary;
-    size_t n = x->size < y->size ? x->size : y->size;
-    int c = n > 0 ? memcmp(x->bytes, y->bytes, n) : 0;
+    size_t xbits = bitstring_bits(x), ybits = bitstring_bits(y);
+    size_t common = xbits < ybits ? xbits : ybits;
+    size_t whole = common / 8;
+    int c = whole > 0 ? memcmp(x->bytes, y->bytes, whole) : 0;
     if (c != 0) return c < 0 ? -1 : 1;
-    return (x->size > y->size) - (x->size < y->size);
+    for (size_t i = whole * 8; i < common; i++) {
+        int p = get_bit(x->bytes, i), q = get_bit(y->bytes, i);
+        if (p != q) return p < q ? -1 : 1;
+    }
+    return (xbits > ybits) - (xbits < ybits);
 }
 
 static bool decode_utf8(const unsigned char *s, size_t n, int64_t *code, size_t *length);
@@ -96,11 +141,15 @@ static bool printable_utf8(const AlkuBinary *bin) {
 }
 
 /* ~p shows text: <<"abc">> (bytes as Latin-1) or <<"hä"/utf8>>; anything
- * else, and ~w, shows the bytes: <<1,2,3>>. */
+ * else, and ~w, shows the bytes: <<1,2,3>>. A bitstring ends with its
+ * last bits as Value:Size, like <<1,2,5:3>>. */
 void print_binary(Buffer *b, Value v, bool pretty) {
     const AlkuBinary *bin = v.as.binary;
     buf_puts(b, "<<");
-    if (pretty && bin->size > 0 && printable_utf8(bin)) {
+    bool utf8 = pretty && bin->size > 0 && printable_utf8(bin);
+    bool latin1 = !utf8 && pretty && bin->size > 0;
+    for (size_t i = 0; latin1 && i < bin->size; i++) latin1 = printable_code(bin->bytes[i]);
+    if (utf8) {
         buf_putc(b, '"');
         for (size_t i = 0; i < bin->size;) {
             int64_t c;
@@ -109,12 +158,8 @@ void print_binary(Buffer *b, Value v, bool pretty) {
             print_quoted(b, c);
             i += length;
         }
-        buf_puts(b, "\"/utf8>>");
-        return;
-    }
-    bool latin1 = pretty && bin->size > 0;
-    for (size_t i = 0; latin1 && i < bin->size; i++) latin1 = printable_code(bin->bytes[i]);
-    if (latin1) {
+        buf_puts(b, "\"/utf8");
+    } else if (latin1) {
         buf_putc(b, '"');
         for (size_t i = 0; i < bin->size; i++) print_quoted(b, bin->bytes[i]);
         buf_putc(b, '"');
@@ -124,14 +169,16 @@ void print_binary(Buffer *b, Value v, bool pretty) {
             buf_int(b, bin->bytes[i]);
         }
     }
+    if (bin->extra) {
+        if (bin->size > 0) buf_putc(b, ',');
+        buf_int(b, bin->bytes[bin->size] >> (8 - bin->extra));
+        buf_putc(b, ':');
+        buf_int(b, bin->extra);
+    }
     buf_puts(b, ">>");
 }
 
 /* ---------- Bits ---------- */
-
-static int get_bit(const unsigned char *data, size_t pos) {
-    return (data[pos >> 3] >> (7 - (pos & 7))) & 1;
-}
 
 static void builder_reserve(AlkuBinBuilder *b, size_t bits) {
     size_t bytes = (b->bits + bits + 7) / 8;
@@ -148,10 +195,12 @@ static void builder_reserve(AlkuBinBuilder *b, size_t bits) {
 /* Appends nbits bits of src, starting at bit offset `from`. */
 static void put_bits(AlkuBinBuilder *b, const unsigned char *src, size_t from, size_t nbits) {
     builder_reserve(b, nbits);
-    if (b->bits % 8 == 0 && from % 8 == 0 && nbits % 8 == 0) {
-        if (nbits > 0) memcpy(b->data + b->bits / 8, src + from / 8, nbits / 8);
-        b->bits += nbits;
-        return;
+    if (b->bits % 8 == 0 && from % 8 == 0) {
+        if (nbits >= 8) memcpy(b->data + b->bits / 8, src + from / 8, nbits / 8);
+        size_t done = nbits / 8 * 8;
+        b->bits += done;
+        from += done;
+        nbits -= done;
     }
     for (size_t i = 0; i < nbits; i++) {
         size_t pos = b->bits + i;
@@ -232,10 +281,14 @@ void alku_bin_put_float(AlkuBinBuilder *b, Value v, Value size, unsigned unit, i
     put_bits(b, bytes, 0, bits);
 }
 
+/* /binary (unit 8) or /bitstring (unit 1). Without a size the whole value
+ * goes in, and its length must be a multiple of the unit. */
 void alku_bin_put_binary(AlkuBinBuilder *b, Value v, Value size, unsigned unit) {
-    AlkuBinary *bin = binary_arg(v);
-    size_t bits = bin->size * 8;
-    if (!is_atom_named(size, "all")) {
+    AlkuBinary *bin = bitstring_arg(v);
+    size_t bits = bitstring_bits(bin);
+    if (is_atom_named(size, "all")) {
+        if (unit > 1 && bits % unit != 0) badarg(v);
+    } else {
         size_t wanted;
         if (!segment_bits(size, unit, &wanted) || wanted > bits) badarg(size);
         bits = wanted;
@@ -243,20 +296,49 @@ void alku_bin_put_binary(AlkuBinBuilder *b, Value v, Value size, unsigned unit) 
     put_bits(b, bin->bytes, 0, bits);
 }
 
+static bool valid_code(Value v) {
+    return v.tag == ALKU_INT && is_char_code(v.as.integer) &&
+           !(v.as.integer >= 0xD800 && v.as.integer <= 0xDFFF);
+}
+
 void alku_bin_put_utf8(AlkuBinBuilder *b, Value v) {
-    if (v.tag != ALKU_INT || !is_char_code(v.as.integer)) badarg(v);
+    if (!valid_code(v)) badarg(v);
     Buffer text = {0};
     buf_utf8(&text, v.as.integer);
     put_bits(b, (const unsigned char *)text.data, 0, text.length * 8);
     free(text.data);
 }
 
-Value alku_bin_end(AlkuBinBuilder *b) {
-    if (b->bits % 8 != 0) {
-        free(b->data);
-        raise_error(pair("badarg", alku_atom("bitstrings_are_not_supported")));
+static void put_unit16(AlkuBinBuilder *b, unsigned u, int flags) {
+    unsigned char bytes[2] = {(unsigned char)(u >> 8), (unsigned char)u};
+    if (flags & ALKU_BIN_LITTLE) reverse_bytes(bytes, 2);
+    put_bits(b, bytes, 0, 16);
+}
+
+/* UTF-16: one 16-bit unit, or a surrogate pair above U+FFFF. */
+void alku_bin_put_utf16(AlkuBinBuilder *b, Value v, int flags) {
+    if (!valid_code(v)) badarg(v);
+    int64_t c = v.as.integer;
+    if (c < 0x10000) {
+        put_unit16(b, (unsigned)c, flags);
+    } else {
+        c -= 0x10000;
+        put_unit16(b, (unsigned)(0xD800 | (c >> 10)), flags);
+        put_unit16(b, (unsigned)(0xDC00 | (c & 0x3FF)), flags);
     }
-    Value result = make_binary(b->data, b->bits / 8);
+}
+
+void alku_bin_put_utf32(AlkuBinBuilder *b, Value v, int flags) {
+    if (!valid_code(v)) badarg(v);
+    uint32_t c = (uint32_t)v.as.integer;
+    unsigned char bytes[4] = {(unsigned char)(c >> 24), (unsigned char)(c >> 16),
+                              (unsigned char)(c >> 8), (unsigned char)c};
+    if (flags & ALKU_BIN_LITTLE) reverse_bytes(bytes, 4);
+    put_bits(b, bytes, 0, 32);
+}
+
+Value alku_bin_end(AlkuBinBuilder *b) {
+    Value result = make_bitstring(b->data, b->bits);
     free(b->data);
     return result;
 }
@@ -267,7 +349,7 @@ bool alku_bin_match_start(AlkuBinMatch *m, Value v) {
     if (v.tag != ALKU_BINARY) return false;
     m->binary = v.as.binary;
     m->pos = 0;
-    m->bits = v.as.binary->size * 8;
+    m->bits = bitstring_bits(v.as.binary);
     return true;
 }
 
@@ -320,20 +402,21 @@ bool alku_bin_get_float(AlkuBinMatch *m, Value size, unsigned unit, int flags, V
 bool alku_bin_get_binary(AlkuBinMatch *m, Value size, unsigned unit, Value *out) {
     size_t bits;
     if (!segment_bits(size, unit, &bits) || m->pos + bits > m->bits) return false;
-    if (m->pos % 8 != 0 || bits % 8 != 0) return false; /* no bitstrings */
-    *out = sub_binary(m->binary, m->pos / 8, bits / 8);
+    *out = sub_bits(m->binary, m->pos, bits);
     m->pos += bits;
     return true;
 }
 
-bool alku_bin_get_rest(AlkuBinMatch *m, Value *out) {
-    if (m->pos % 8 != 0) return false;
-    *out = sub_binary(m->binary, m->pos / 8, (m->bits - m->pos) / 8);
+/* The rest of the bits; for /binary (unit 8) they must be whole bytes. */
+bool alku_bin_get_rest(AlkuBinMatch *m, unsigned unit, Value *out) {
+    size_t bits = m->bits - m->pos;
+    if (unit > 1 && bits % unit != 0) return false;
+    *out = sub_bits(m->binary, m->pos, bits);
     m->pos = m->bits;
     return true;
 }
 
-/* Decodes one UTF-8 character at a byte boundary. */
+/* Decodes one UTF-8 character. */
 static bool decode_utf8(const unsigned char *s, size_t n, int64_t *code, size_t *length) {
     if (n == 0) return false;
     unsigned char c = s[0];
@@ -351,14 +434,57 @@ static bool decode_utf8(const unsigned char *s, size_t n, int64_t *code, size_t 
     return true;
 }
 
+/* Up to n whole bytes from the match position (the bits need not be
+ * byte-aligned); returns how many there were. */
+static size_t peek_bytes(const AlkuBinMatch *m, unsigned char *out, size_t n) {
+    size_t available = (m->bits - m->pos) / 8;
+    if (n > available) n = available;
+    if (n > 0) get_bits(m->binary->bytes, m->pos, n * 8, out, n);
+    return n;
+}
+
 bool alku_bin_get_utf8(AlkuBinMatch *m, Value *out) {
-    if (m->pos % 8 != 0) return false;
+    unsigned char bytes[4];
+    size_t n = peek_bytes(m, bytes, 4);
     int64_t code;
     size_t length;
-    size_t at = m->pos / 8;
-    if (!decode_utf8(m->binary->bytes + at, m->binary->size - at, &code, &length)) return false;
+    if (!decode_utf8(bytes, n, &code, &length)) return false;
     *out = alku_int(code);
     m->pos += length * 8;
+    return true;
+}
+
+bool alku_bin_get_utf16(AlkuBinMatch *m, int flags, Value *out) {
+    unsigned char bytes[4];
+    size_t n = peek_bytes(m, bytes, 4);
+    if (n < 2) return false;
+    if (flags & ALKU_BIN_LITTLE) {
+        reverse_bytes(bytes, 2);
+        if (n == 4) reverse_bytes(bytes + 2, 2);
+    }
+    unsigned first = (unsigned)bytes[0] << 8 | bytes[1];
+    if (first < 0xD800 || first > 0xDFFF) {
+        *out = alku_int(first);
+        m->pos += 16;
+        return true;
+    }
+    if (first > 0xDBFF || n < 4) return false; /* a lone low surrogate, or cut off */
+    unsigned second = (unsigned)bytes[2] << 8 | bytes[3];
+    if (second < 0xDC00 || second > 0xDFFF) return false;
+    *out = alku_int(0x10000 + ((int64_t)(first - 0xD800) << 10) + (second - 0xDC00));
+    m->pos += 32;
+    return true;
+}
+
+bool alku_bin_get_utf32(AlkuBinMatch *m, int flags, Value *out) {
+    unsigned char bytes[4];
+    if (peek_bytes(m, bytes, 4) < 4) return false;
+    if (flags & ALKU_BIN_LITTLE) reverse_bytes(bytes, 4);
+    int64_t c = (int64_t)bytes[0] << 24 | (int64_t)bytes[1] << 16 | (int64_t)bytes[2] << 8 | bytes[3];
+    Value v = alku_int(c);
+    if (!valid_code(v)) return false;
+    *out = v;
+    m->pos += 32;
     return true;
 }
 
@@ -378,9 +504,57 @@ static Value buffer_to_binary(Buffer *b) {
     return result;
 }
 
-Value alku_bif_is_binary(Value v) { return boolean(v.tag == ALKU_BINARY); }
-Value alku_bif_byte_size(Value v) { return alku_int((int64_t)binary_arg(v)->size); }
-Value alku_bif_bit_size(Value v) { return alku_int((int64_t)binary_arg(v)->size * 8); }
+Value alku_bif_is_binary(Value v) { return boolean(v.tag == ALKU_BINARY && v.as.binary->extra == 0); }
+Value alku_bif_is_bitstring(Value v) { return boolean(v.tag == ALKU_BINARY); }
+
+Value alku_bif_byte_size(Value v) {
+    AlkuBinary *b = bitstring_arg(v);
+    return alku_int((int64_t)(b->size + (b->extra ? 1 : 0)));
+}
+
+Value alku_bif_bit_size(Value v) { return alku_int((int64_t)bitstring_bits(bitstring_arg(v))); }
+
+/* Bytes, and the last few bits as a bitstring. */
+Value alku_bif_bitstring_to_list(Value v) {
+    AlkuBinary *bin = bitstring_arg(v);
+    Value list = alku_nil();
+    if (bin->extra) list = alku_cons(sub_bits(bin, bin->size * 8, bin->extra), list);
+    for (size_t i = bin->size; i-- > 0;) list = alku_cons(alku_int(bin->bytes[i]), list);
+    return list;
+}
+
+/* Like list_to_binary, but bitstrings may appear anywhere. */
+static void put_bitstring_list(AlkuBinBuilder *b, Value v, Value arg) {
+    if (v.tag == ALKU_BINARY) {
+        put_bits(b, v.as.binary->bytes, 0, bitstring_bits(v.as.binary));
+        return;
+    }
+    for (; v.tag == ALKU_CONS; v = v.as.cons->tail) {
+        Value c = v.as.cons->head;
+        if (c.tag == ALKU_INT && c.as.integer >= 0 && c.as.integer <= 255) {
+            unsigned char byte = (unsigned char)c.as.integer;
+            put_bits(b, &byte, 0, 8);
+        } else if (c.tag == ALKU_CONS || c.tag == ALKU_NIL || c.tag == ALKU_BINARY) {
+            put_bitstring_list(b, c, arg);
+        } else {
+            free(b->data);
+            badarg(arg);
+        }
+    }
+    if (v.tag == ALKU_BINARY) {
+        put_bitstring_list(b, v, arg);
+    } else if (v.tag != ALKU_NIL) {
+        free(b->data);
+        badarg(arg);
+    }
+}
+
+Value alku_bif_list_to_bitstring(Value v) {
+    AlkuBinBuilder b;
+    alku_bin_begin(&b);
+    put_bitstring_list(&b, v, v);
+    return alku_bin_end(&b);
+}
 
 Value alku_bif_binary_to_list(Value v) {
     AlkuBinary *bin = binary_arg(v);

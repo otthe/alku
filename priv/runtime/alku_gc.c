@@ -220,12 +220,13 @@ static void trace(void *object) {
     }
 }
 
+/* Reading every word of the stack is intended here, so AddressSanitizer
+ * (when testing the runtime with it) is told not to check these reads. */
+__attribute__((no_sanitize_address))
 static void scan_range(const void *start, const void *end) {
     uintptr_t p = ((uintptr_t)start + sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
     for (; p + sizeof(uintptr_t) <= (uintptr_t)end; p += sizeof(uintptr_t)) {
-        uintptr_t word;
-        memcpy(&word, (const void *)p, sizeof word);
-        mark_address(word);
+        mark_address(*(const volatile uintptr_t *)p);
     }
 }
 

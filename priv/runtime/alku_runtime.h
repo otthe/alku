@@ -21,13 +21,14 @@
 #include <stdint.h>
 
 /* Tags are declared in Erlang term order:
- * number < atom < fun < pid < tuple < map < nil < list < binary.
+ * number < atom < reference < fun < pid < tuple < map < nil < list < binary.
  * The three number tags compare by numeric value. */
 typedef enum {
     ALKU_INT,   /* integer that fits in 64 bits */
     ALKU_BIG,   /* any other integer (on the heap) */
     ALKU_FLOAT,
     ALKU_ATOM,
+    ALKU_REF, /* make_ref(): a number in as.integer */
     ALKU_FUN,
     ALKU_PID, /* an open file, like the pids Erlang uses for files */
     ALKU_TUPLE,
@@ -85,9 +86,11 @@ struct AlkuMapNode {
 
 /* A binary: size bytes at bytes. A binary owns its bytes (they follow
  * the struct in data) or, as a sub-binary made by matching, points into
- * the bytes of its parent. */
+ * the bytes of its parent. A bitstring has 1-7 extra bits after the size
+ * whole bytes, in the top bits of one more byte (the rest of it is 0). */
 struct AlkuBinary {
     size_t size;
+    unsigned extra; /* bits after the whole bytes: 0 for a binary */
     const unsigned char *bytes;
     AlkuBinary *parent; /* NULL when the bytes are in data */
     unsigned char data[];
@@ -160,6 +163,26 @@ Value alku_apply(Value fun, size_t arity, const Value *args);
 Value alku_tail_apply(Value fun, size_t arity, const Value *args);
 Value alku_tail_call(AlkuCode code, AlkuFun *self, size_t arity, const Value *args);
 Value alku_run_pending(void);
+
+/* Calls where the module or function is only known when the program runs
+ * (Mod:Fun(...), apply/3, fun M:F/A with variables) look the function up
+ * in this table of every exported function and built-in. The compiler
+ * writes the table into each program. */
+typedef struct {
+    const char *module;
+    const char *function;
+    size_t arity;
+    AlkuCode code;
+} AlkuExport;
+
+extern const AlkuExport alku_exports[];
+extern const size_t alku_export_count;
+
+AlkuCode alku_lookup_mfa(Value module, Value function, size_t arity); /* raises undef */
+Value alku_make_mfa_fun(Value module, Value function, Value arity);  /* fun M:F/A */
+Value alku_bif_apply_3(Value module, Value function, Value args);
+Value alku_tail_apply_2(Value fun, Value args); /* apply/2,3 as tail calls */
+Value alku_tail_apply_3(Value module, Value function, Value args);
 
 /* A tail call returns a pending marker instead of calling the target, so
  * the C stack does not grow. Every non-tail call site runs pending calls
@@ -255,14 +278,18 @@ void alku_bin_put_integer(AlkuBinBuilder *b, Value v, Value size, unsigned unit,
 void alku_bin_put_float(AlkuBinBuilder *b, Value v, Value size, unsigned unit, int flags);
 void alku_bin_put_binary(AlkuBinBuilder *b, Value v, Value size, unsigned unit); /* size all: whole */
 void alku_bin_put_utf8(AlkuBinBuilder *b, Value v);
+void alku_bin_put_utf16(AlkuBinBuilder *b, Value v, int flags);
+void alku_bin_put_utf32(AlkuBinBuilder *b, Value v, int flags);
 Value alku_bin_end(AlkuBinBuilder *b);
 
 bool alku_bin_match_start(AlkuBinMatch *m, Value v);
 bool alku_bin_get_integer(AlkuBinMatch *m, Value size, unsigned unit, int flags, Value *out);
 bool alku_bin_get_float(AlkuBinMatch *m, Value size, unsigned unit, int flags, Value *out);
 bool alku_bin_get_binary(AlkuBinMatch *m, Value size, unsigned unit, Value *out);
-bool alku_bin_get_rest(AlkuBinMatch *m, Value *out);
+bool alku_bin_get_rest(AlkuBinMatch *m, unsigned unit, Value *out);
 bool alku_bin_get_utf8(AlkuBinMatch *m, Value *out);
+bool alku_bin_get_utf16(AlkuBinMatch *m, int flags, Value *out);
+bool alku_bin_get_utf32(AlkuBinMatch *m, int flags, Value *out);
 bool alku_bin_match_end(AlkuBinMatch *m);
 
 /* Built-in functions */
@@ -307,6 +334,22 @@ Value alku_maps_from_list(Value list);
 Value alku_maps_size(Value map);
 Value alku_maps_merge(Value a, Value b);
 Value alku_bif_is_binary(Value v);
+Value alku_bif_is_bitstring(Value v);
+Value alku_bif_bitstring_to_list(Value v);
+Value alku_bif_list_to_bitstring(Value v);
+Value alku_bif_term_to_binary_1(Value term);
+Value alku_bif_term_to_binary_2(Value term, Value options);
+Value alku_bif_binary_to_term_1(Value bin);
+Value alku_bif_binary_to_term_2(Value bin, Value options);
+Value alku_bif_phash2_1(Value term);
+Value alku_bif_phash2_2(Value term, Value range);
+Value alku_bif_make_ref(void);
+Value alku_bif_is_reference(Value v);
+Value alku_bif_unique_integer_0(void);
+Value alku_bif_unique_integer_1(Value options);
+Value alku_bif_insert_element(Value n, Value tuple, Value v);
+Value alku_bif_delete_element(Value n, Value tuple);
+Value alku_bif_append_element(Value tuple, Value v);
 Value alku_bif_byte_size(Value v);
 Value alku_bif_bit_size(Value v);
 Value alku_bif_binary_to_list(Value v);

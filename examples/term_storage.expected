@@ -1,0 +1,10 @@
+true
+<<131,104,3,119,2,111,107,97,1,107,0,2,104,105>>
+Alku 0.7
+hello
+bad
+true true
+true true
+true
+{a,b,c} {b} {a,b}
+fun lists:sum/1 6

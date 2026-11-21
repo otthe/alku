@@ -4,8 +4,9 @@
 %%   together with the standard library) -> alku_cc (C compiler) -> executable
 %%
 %% A program is its main module plus every module it uses: when a module
-%% calls shapes:area(...), shapes.erl is loaded from the main module's
-%% directory, and so on for the modules that one uses.
+%% calls shapes:area(...) (or just mentions the atom shapes), shapes.erl is
+%% loaded from the main module's directory, and so on for the modules that
+%% one uses.
 -module(alku_compiler).
 
 -export([to_c/1, build/2]).
@@ -96,13 +97,18 @@ reserved(Module) ->
 source(Dir, Module) ->
     filename:join(Dir, atom_to_list(Module) ++ ".erl").
 
-%% Modules named in remote calls, fun M:F/A and -import.
+%% Modules named in remote calls, fun M:F/A and -import, and every other
+%% atom in the code: a module called by name at run time (Mod:f() with
+%% Mod = shapes) is loaded when its file is next to the program.
 used_modules(Forms) ->
     lists:usort(modules_in(Forms)).
 
-modules_in({remote, _, {atom, _, M}, F}) -> [M | modules_in(F)];
+modules_in({remote, _, {atom, _, M}, {atom, _, _Function}}) -> [M];
 modules_in({'fun', _, {function, {atom, _, M}, _, _}}) -> [M];
 modules_in({attribute, _, import, {M, _}}) -> [M];
+modules_in({attribute, _, _, _}) -> []; % -module, -export, -record, ...
+modules_in({call, _, {atom, _, _LocalFunction}, Args}) -> modules_in(Args);
+modules_in({atom, _, M}) -> [M];
 modules_in(T) when is_tuple(T) -> modules_in(tuple_to_list(T));
 modules_in(L) when is_list(L) -> lists:flatmap(fun modules_in/1, L);
 modules_in(_) -> [].

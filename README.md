@@ -42,24 +42,30 @@ alku c FILE.erl                   # show the generated C code
 you can put it on your PATH, e.g.
 `ln -s "$PWD/_build/default/bin/alku" ~/.local/bin/alku`.
 
-## What works now (phase 6)
+## What works now (phase 7)
 
 - Integers of any size (small ones are fast; big ones grow as needed),
   floats, atoms, tuples, lists, strings (lists of character codes, as in
   Erlang), binaries, maps, records and funs
-- **Programs of several modules**: when a module calls `shapes:area(X)`,
-  `alku` compiles `shapes.erl` from the same directory too (and the
-  modules that one uses). Calls to unexported functions and missing
-  modules are compile errors. `-import` works.
-- **Binaries and the bit syntax**: `<<1, 300:16, X/binary>>`, patterns
-  like `<<Len:16, Data:Len/binary, Rest/binary>>`, segments of any bit
-  size, `integer`/`float`/`binary`/`utf8`, `signed`, `little`, `unit:N`,
-  binary comprehensions `<< <<X>> || <<X>> <= B >>` and binary generators.
-  Matching shares memory instead of copying. A whole binary must be a
-  whole number of bytes (no bitstrings)
+- **Programs of several modules**: when a module calls `shapes:area(X)`
+  (or just mentions the atom `shapes`), `alku` compiles `shapes.erl` from
+  the same directory too (and the modules that one uses). Calls to
+  unexported functions and missing modules are compile errors. `-import`
+  works.
+- **Calls chosen at run time**: `Mod:Fun(Args)` with variables,
+  `apply/3`, `fun M:F/A` with variables. The function must be exported
+  (or a built-in), otherwise the call raises `undef`, as in Erlang.
+  `apply/2,3` in tail position are tail calls.
+- **Binaries, bitstrings and the bit syntax**: `<<1, 300:16, X/binary>>`,
+  patterns like `<<Len:16, Data:Len/binary, Rest/binary>>`, segments of
+  any bit size, `integer`/`float`/`binary`/`bitstring`/`utf8`/`utf16`/
+  `utf32`, `signed`, `little`, `unit:N`, binary comprehensions
+  `<< <<X>> || <<X>> <= B >>` and binary generators. Bitstrings (any
+  number of bits, like `<<5:3>>`) work everywhere. Matching shares memory
+  instead of copying
 - Functions with multiple clauses, pattern matching and guards (`,` and `;`)
-- Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`, `P1 = P2`,
-  repeated variables
+- Patterns: variables, literals, `{...}`, `[H | T]`, `"abc"`,
+  `"GET " ++ Path`, `P1 = P2`, repeated variables
 - `case`, `if`, `begin ... end`, `=` matches; variables bound in every
   clause of a `case`/`if` can be used after it
 - Exceptions: `try ... of ... catch ... after ... end`, `catch Expr`,
@@ -124,7 +130,14 @@ you can put it on your PATH, e.g.
   is_defined lookup lookup_all to_map`
 - `io_lib:format/2`, `timer:sleep/1 tc/1,2`, `rand:uniform/0,1`,
   `os:getenv/1,2 timestamp/0`, `erlang:system_time/0,1 monotonic_time/0,1`,
-  `float_to_binary/1,2`, `binary_to_float/1`, `make_tuple/2`, `size/1`
+  `float_to_binary/1,2`, `binary_to_float/1`, `erlang:make_tuple/2`, `size/1`
+- `term_to_binary/1,2` and `binary_to_term/1,2` in Erlang's external term
+  format (the bytes are the same as OTP 26 writes, so Erlang can read
+  them; compressed terms and local funs are not supported),
+  `erlang:phash2/1,2` (stable between runs, but the numbers differ from
+  Erlang's), `make_ref/0`, `is_reference/1`, `erlang:unique_integer/0,1`,
+  `erlang:insert_element/3 delete_element/2 append_element/2`,
+  `is_bitstring/1`, `bitstring_to_list/1`, `list_to_bitstring/1`, `apply/3`
 - `io:format` controls: `~w ~p ~s ~c ~b ~B ~f ~e ~i ~n ~~` with field
   width, precision and padding (`~5B`, `~-10s`, `~.2f`, `~2..0B`, `~.16B`)
 - Erlang-style runtime errors with stack traces:
@@ -141,8 +154,9 @@ the same output under `erl`. Differences: `~p` never breaks long terms
 over several lines, and maps with more than 32 keys print in key order
 (Erlang uses hash order for those).
 
-Not yet: bitstrings, utf16/utf32 segments, `"abc" ++ Rest` patterns, `~g`,
-`apply/3` and calls to modules chosen at run time.
+Not yet: the process dictionary (`put/get`), `maybe` expressions, `~g`, and
+the OTP modules `queue`, `sets`, `gb_trees`, `dict`, `orddict`, `ordsets`
+and `array`.
 
 ## How the runtime works
 
@@ -156,7 +170,13 @@ Not yet: bitstrings, utf16/utf32 segments, `"abc" ++ Rest` patterns, `~g`,
   costs O(log n) and never changes the old map.
 - **Binaries** (`alku_binary.c`): a binary owns its bytes, or (when made by
   matching) points into another binary's bytes, so `<<X, Rest/binary>>`
-  loops run in linear time.
+  loops run in linear time. A bitstring keeps its last 1-7 bits in one
+  extra byte; parts that don't start on a byte boundary are copied.
+- **Calls by name** (`Mod:Fun(...)`, `apply/3`): each program has a table
+  of its exported functions and all built-ins, which the runtime looks up
+  by module, name and arity.
+- **External term format** (`alku_term.c`): `term_to_binary` and
+  `binary_to_term`.
 - **Calls**: every Alku function and fun body is a C function taking its
   arguments as an array. A call in tail position to the function itself
   becomes a `goto` back to its start. Any other tail call returns a

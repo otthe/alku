@@ -1,0 +1,8 @@
+{get,"/index.html"}
+{post,"/login"}
+unknown
+{length,42}
+{custom,"Trace"}
+{other,"Host"}
+def
+hi world

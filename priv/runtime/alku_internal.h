@@ -5,6 +5,7 @@
  *   alku_number.c   integers (with bignums), floats, math
  *   alku_map.c      maps
  *   alku_binary.c   binaries and the bit syntax
+ *   alku_term.c     term_to_binary, binary_to_term, phash2
  *   alku_gc.c       memory
  */
 #ifndef ALKU_INTERNAL_H
@@ -64,9 +65,14 @@ Value integer_from_be_bytes(const unsigned char *in, size_t n, bool is_signed);
 
 /* alku_binary.c */
 Value make_binary(const void *bytes, size_t n);
+Value make_bitstring(const void *data, size_t bits);
+size_t bitstring_bits(const AlkuBinary *b);
 void print_binary(Buffer *b, Value v, bool pretty);
 int compare_binaries(Value a, Value b);
 void append_binary(Buffer *b, Value v);
+
+/* alku_runtime.c */
+bool is_mfa_fun(const AlkuFun *f); /* made by alku_make_mfa_fun */
 
 /* alku_map.c */
 int compare_maps(Value a, Value b, bool exact);

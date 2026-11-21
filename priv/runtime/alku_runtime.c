@@ -164,9 +164,21 @@ void print_value(Buffer *b, Value v, bool pretty) {
     case ALKU_BINARY:
         print_binary(b, v, pretty);
         break;
+    case ALKU_REF:
+        buf_puts(b, "#Ref<0.0.0.");
+        buf_int(b, v.as.integer);
+        buf_putc(b, '>');
+        break;
     case ALKU_FUN:
         /* "fun lists:map/2" for external funs, #Fun<...> for the rest */
-        if (strncmp(v.as.fun->name, "fun ", 4) == 0) {
+        if (is_mfa_fun(v.as.fun)) {
+            buf_puts(b, "fun ");
+            print_atom(b, v.as.fun->env[0].as.atom);
+            buf_putc(b, ':');
+            print_atom(b, v.as.fun->env[1].as.atom);
+            buf_putc(b, '/');
+            buf_int(b, (int64_t)v.as.fun->arity);
+        } else if (strncmp(v.as.fun->name, "fun ", 4) == 0) {
             buf_puts(b, v.as.fun->name);
         } else {
             buf_puts(b, "#Fun<");
@@ -248,7 +260,7 @@ static Value stack_trace(void) {
 static struct {
     const char *function; /* function_clause: the function's name */
     Value args;           /* ... and its arguments, as a list */
-    bool has_detail;      /* badarg: the offending value */
+    bool has_detail;      /* badarg: the offending value; undef: {M, F, Arity} */
     Value detail;
 } error_info;
 
@@ -371,6 +383,14 @@ static void describe_error(Buffer *b, Value reason) {
             print_value(b, a.as.cons->head, true);
         }
         buf_putc(b, ')');
+    } else if (is_atom_named(reason, "undef") && error_info.has_detail) {
+        const Value *mfa = error_info.detail.as.tuple->elements;
+        buf_puts(b, "undefined function ");
+        print_value(b, mfa[0], true);
+        buf_putc(b, ':');
+        print_value(b, mfa[1], true);
+        buf_putc(b, '/');
+        print_value(b, mfa[2], true);
     } else if (is_atom_named(reason, "badarg")) {
         buf_puts(b, "bad argument");
         if (error_info.has_detail) {
@@ -591,16 +611,17 @@ static int term_class(AlkuTag tag) {
     case ALKU_BIG:
     case ALKU_FLOAT: return 0;
     case ALKU_ATOM: return 1;
-    case ALKU_FUN: return 2;
-    case ALKU_PID: return 3;
-    case ALKU_TUPLE: return 4;
-    case ALKU_MAP: return 5;
-    case ALKU_NIL: return 6;
-    case ALKU_CONS: return 7;
-    case ALKU_BINARY: return 8;
-    case ALKU_PENDING: return 9;
+    case ALKU_REF: return 2;
+    case ALKU_FUN: return 3;
+    case ALKU_PID: return 4;
+    case ALKU_TUPLE: return 5;
+    case ALKU_MAP: return 6;
+    case ALKU_NIL: return 7;
+    case ALKU_CONS: return 8;
+    case ALKU_BINARY: return 9;
+    case ALKU_PENDING: return 10;
     }
-    return 9;
+    return 10;
 }
 
 int compare_terms(Value a, Value b, bool exact) {
@@ -621,6 +642,7 @@ int compare_terms(Value a, Value b, bool exact) {
         case ALKU_ATOM:
             return sign(strcmp(a.as.atom, b.as.atom));
         case ALKU_PID:
+        case ALKU_REF:
             return (a.as.integer > b.as.integer) - (a.as.integer < b.as.integer);
         case ALKU_NIL:
         case ALKU_PENDING:
@@ -821,6 +843,38 @@ Value alku_bif_setelement(Value n, Value tuple, Value v) {
     size_t i = tuple_index(n, tuple);
     Value copy = alku_make_tuple(tuple.as.tuple->arity, tuple.as.tuple->elements);
     copy.as.tuple->elements[i] = v;
+    return copy;
+}
+
+/* insert_element(2, {a, c}, b) is {a, b, c} */
+Value alku_bif_insert_element(Value n, Value tuple, Value v) {
+    if (tuple.tag != ALKU_TUPLE) badarg(tuple);
+    size_t arity = tuple.as.tuple->arity;
+    if (n.tag != ALKU_INT || n.as.integer < 1 || (uint64_t)n.as.integer > arity + 1) badarg(n);
+    size_t at = (size_t)n.as.integer - 1;
+    Value copy = alku_make_tuple(arity + 1, NULL);
+    for (size_t i = 0, j = 0; i <= arity; i++) {
+        copy.as.tuple->elements[i] = i == at ? v : tuple.as.tuple->elements[j++];
+    }
+    return copy;
+}
+
+Value alku_bif_delete_element(Value n, Value tuple) {
+    size_t at = tuple_index(n, tuple);
+    size_t arity = tuple.as.tuple->arity;
+    Value copy = alku_make_tuple(arity - 1, NULL);
+    for (size_t i = 0, j = 0; i < arity; i++) {
+        if (i != at) copy.as.tuple->elements[j++] = tuple.as.tuple->elements[i];
+    }
+    return copy;
+}
+
+Value alku_bif_append_element(Value tuple, Value v) {
+    if (tuple.tag != ALKU_TUPLE) badarg(tuple);
+    size_t arity = tuple.as.tuple->arity;
+    Value copy = alku_make_tuple(arity + 1, NULL);
+    for (size_t i = 0; i < arity; i++) copy.as.tuple->elements[i] = tuple.as.tuple->elements[i];
+    copy.as.tuple->elements[arity] = v;
     return copy;
 }
 
@@ -1484,6 +1538,114 @@ Value alku_tail_apply(Value fun, size_t arity, const Value *args) {
     AlkuFun *f = checked_fun(fun, arity, args);
     return alku_tail_call(f->code, f, arity, args);
 }
+
+/* ---------- Calls by name ---------- */
+
+/* A hash table over alku_exports, built on first use. */
+static const AlkuExport **export_table;
+static size_t export_slots;
+
+static uint64_t mfa_hash(const char *module, const char *function, size_t arity) {
+    uint64_t h = 1469598103934665603u;
+    for (const char *c = module; *c != '\0'; c++) h = (h ^ (unsigned char)*c) * 1099511628211u;
+    h = (h ^ ':') * 1099511628211u;
+    for (const char *c = function; *c != '\0'; c++) h = (h ^ (unsigned char)*c) * 1099511628211u;
+    return (h ^ arity) * 1099511628211u;
+}
+
+static void build_export_table(void) {
+    export_slots = 16;
+    while (export_slots < 2 * alku_export_count) export_slots *= 2;
+    export_table = calloc(export_slots, sizeof *export_table);
+    if (export_table == NULL) out_of_memory();
+    for (size_t i = 0; i < alku_export_count; i++) {
+        const AlkuExport *e = &alku_exports[i];
+        size_t slot = mfa_hash(e->module, e->function, e->arity) & (export_slots - 1);
+        while (export_table[slot] != NULL) slot = (slot + 1) & (export_slots - 1);
+        export_table[slot] = e;
+    }
+}
+
+/* Module:Function/Arity, which must be exported (or a built-in), as for
+ * any call from outside the module in Erlang. */
+AlkuCode alku_lookup_mfa(Value module, Value function, size_t arity) {
+    if (module.tag != ALKU_ATOM) badarg(module);
+    if (function.tag != ALKU_ATOM) badarg(function);
+    if (export_table == NULL) build_export_table();
+    size_t slot = mfa_hash(module.as.atom, function.as.atom, arity) & (export_slots - 1);
+    for (const AlkuExport *e; (e = export_table[slot]) != NULL; slot = (slot + 1) & (export_slots - 1)) {
+        if (e->arity == arity && strcmp(e->function, function.as.atom) == 0 &&
+            strcmp(e->module, module.as.atom) == 0) {
+            return e->code;
+        }
+    }
+    error_info.function = NULL;
+    error_info.has_detail = true;
+    error_info.detail = alku_make_tuple(3, (Value[]){module, function, alku_int((int64_t)arity)});
+    raise_keeping_info(alku_atom("error"), alku_atom("undef"));
+}
+
+/* The code of every fun M:F/A made at run time: env holds M and F. */
+static Value mfa_fun_code(const Value *args, AlkuFun *self) {
+    return alku_lookup_mfa(self->env[0], self->env[1], self->arity)(args, NULL);
+}
+
+bool is_mfa_fun(const AlkuFun *f) {
+    return f->code == mfa_fun_code;
+}
+
+/* As in Erlang, the function is looked up when the fun is called, so it
+ * need not exist yet. */
+Value alku_make_mfa_fun(Value module, Value function, Value arity) {
+    if (module.tag != ALKU_ATOM) badarg(module);
+    if (function.tag != ALKU_ATOM) badarg(function);
+    if (arity.tag != ALKU_INT || arity.as.integer < 0 || arity.as.integer > 255) badarg(arity);
+    return alku_make_fun(mfa_fun_code, (size_t)arity.as.integer, "fun", 2, (Value[]){module, function});
+}
+
+Value alku_bif_apply_3(Value module, Value function, Value args) {
+    Value array = alku_bif_list_to_tuple(args); /* a tuple keeps the values visible to the GC */
+    size_t n = array.as.tuple->arity;
+    return alku_settle(alku_lookup_mfa(module, function, n)(array.as.tuple->elements, NULL));
+}
+
+Value alku_tail_apply_3(Value module, Value function, Value args) {
+    Value array = alku_bif_list_to_tuple(args);
+    size_t n = array.as.tuple->arity;
+    return alku_tail_call(alku_lookup_mfa(module, function, n), NULL, n, array.as.tuple->elements);
+}
+
+Value alku_tail_apply_2(Value fun, Value args) {
+    Value array = alku_bif_list_to_tuple(args);
+    return alku_tail_apply(fun, array.as.tuple->arity, array.as.tuple->elements);
+}
+
+/* ---------- References and unique integers ---------- */
+
+static int64_t refs_made, unique_integers;
+
+Value alku_bif_make_ref(void) {
+    Value v;
+    v.tag = ALKU_REF;
+    v.as.integer = ++refs_made;
+    return v;
+}
+
+Value alku_bif_is_reference(Value v) { return boolean(v.tag == ALKU_REF); }
+
+/* Every result differs and they increase, so the options positive and
+ * monotonic always hold. */
+Value alku_bif_unique_integer_1(Value options) {
+    Value o = options;
+    for (; o.tag == ALKU_CONS; o = o.as.cons->tail) {
+        Value opt = o.as.cons->head;
+        if (!is_atom_named(opt, "positive") && !is_atom_named(opt, "monotonic")) badarg(options);
+    }
+    if (o.tag != ALKU_NIL) badarg(options);
+    return alku_int(++unique_integers);
+}
+
+Value alku_bif_unique_integer_0(void) { return alku_bif_unique_integer_1(alku_nil()); }
 
 /* Programs run on a thread with a big stack, so deep (non-tail) recursion
  * over long lists works as it does in Erlang. Only the pages actually used
